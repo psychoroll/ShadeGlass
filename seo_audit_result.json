@@ -1,0 +1,27 @@
+{
+    "target_url": "https://example.com",
+    "meta": {
+        "title": "Example Domain",
+        "title_length": 14,
+        "description": null,
+        "description_length": 0
+    },
+    "headings": {
+        "h1": [
+            "Example Domain"
+        ],
+        "h2": [],
+        "h3": [],
+        "h4": [],
+        "h5": [],
+        "h6": []
+    },
+    "images": {
+        "total_count": 0,
+        "missing_alt_count": 0
+    },
+    "links": {
+        "internal_count": 0,
+        "external_count": 1
+    }
+}

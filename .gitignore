@@ -1,0 +1,14 @@
+# Ignore private API keys and local configurations
+config.json
+
+# Ignore the local SQLite database containing scraped client data
+workspace_data.db
+
+# Ignore Python cache and compilation files
+__pycache__/
+*.pyc
+
+# Ignore PyInstaller build outputs if you compile later
+build/
+dist/
+*.spec
