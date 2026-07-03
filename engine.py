@@ -96,7 +96,7 @@ def audit_url(url):
     api_status = "Skipped - No active credentials located in file manager."
     
     keys = load_api_keys()
-    google_key = keys.get("google_pagespeed", "").strip()
+    google_key = keys.get("google_pagespeed_key", "").strip()
     
     if google_key:
         api_status = "Connecting to Google Cloud Engines..."
@@ -132,6 +132,8 @@ def audit_url(url):
 
     return report
 
+
+
 if __name__ == "__main__":
     initialize_database()
     proj_name = input("Enter a Project Name: ").strip()
@@ -142,3 +144,109 @@ if __name__ == "__main__":
         if "error" not in audit_result:
             save_new_audit(proj_name, target_url, audit_result)
             print("\nAnalysis Saved Successfully!")
+
+def fetch_open_pagerank(domain, config_path="config.json"):
+    """
+    Fetches free domain authority and ranking metrics from the OpenPageRank API.
+    """
+    # 1. Load keys securely from your local config vault
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            config = json.load(f)
+    else:
+        config = {}
+
+    api_key = config.get("open_pagerank_key", "")
+
+    if not api_key:
+        return {"status": "skipped", "error": "No OpenPageRank API Key configured."}
+
+    # 2. Query OpenPageRank endpoint
+    url = f"https://openpagerank.com/api/v1.0/getPageRank?domains[]={domain}"
+    headers = {"API-OPR": api_key}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            data = response.json()
+            # Extract domain parameters safely from the payload response array
+            if data.get("status_code") == 200:
+                results = data.get("response", [])
+                if results:
+                    domain_info = results[0]
+                    return {
+                        "status": "success",
+                        "page_rank_integer": domain_info.get("page_rank_integer", "N/A"),
+                        "page_rank_decimal": domain_info.get("page_rank_decimal", "N/A"),
+                        "rank": domain_info.get("rank", "N/A")
+                    }
+            return {"status": "error", "error": "Invalid API data format structure."}
+        else:
+            return {"status": "error", "error": f"HTTP Error: {response.status_code}"}
+    except requests.exceptions.RequestException as e:
+        return {"status": "error", "error": f"Connection Timed Out: {str(e)}"}
+
+def fetch_dataforseo(self, domain, api_login, api_password):
+    """
+    Fetches Domain Rank and Spam Score using DataForSEO v3 API.
+    """
+    import requests
+    import base64
+
+    # The correct v3 endpoint for rank and spam score
+    url = "https://api.dataforseo.com/v3/backlinks/summary/live"
+    
+    # DataForSEO requires Base64 encoded credentials
+    credentials = f"{api_login}:{api_password}"
+    encoded_credentials = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
+    
+    headers = {
+        'Authorization': f'Basic {encoded_credentials}',
+        'Content-Type': 'application/json'
+    }
+    
+    # Payload targeting the specific domain
+    payload = [{
+        "target": domain,
+        "internal_list_limit": 1
+    }]
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        data = response.json()
+        
+        # 20000 is DataForSEO's internal success code
+        if response.status_code == 200 and data.get('status_code') == 20000:
+            # Safely navigate their complex JSON response structure
+            try:
+                result = data['tasks'][0]['result'][0]
+                return {
+                    "rank": result.get("rank", "N/A"),
+                    "spam_score": result.get("spam_score", "N/A"),
+                    "status": "Success",
+                    "error": ""
+                }
+            except (IndexError, KeyError):
+                return {
+                    "rank": "N/A", 
+                    "spam_score": "N/A", 
+                    "status": "No Data", 
+                    "error": "Domain not found in index."
+                }
+        else:
+            return {
+                "rank": "N/A", 
+                "spam_score": "N/A", 
+                "status": f"API Error ({data.get('status_code')})",
+                "error": data.get('status_message', 'Unknown Error')
+            }
+            
+    except Exception as e:
+        return {
+            "rank": "N/A", 
+            "spam_score": "N/A", 
+            "status": "Request Failed", 
+            "error": str(e)
+        }
+# Inside your main core auditing orchestrator function where the pipeline triggers:
+# (Update your returned JSON structure layout block to merge this dynamic payload)
