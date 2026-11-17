@@ -149,7 +149,8 @@ def audit_url(url):
 
     # --- 3. Image Optimization ---
     images = soup.find_all('img')
-    missing_alt = sum(1 for img in images if not img.get('alt') or not img.get('alt').strip())
+    # alt="" is the correct markup for decorative images, so only a missing alt attribute counts.
+    missing_alt = sum(1 for img in images if img.get('alt') is None)
 
     # --- 4. Link Density Mapping ---
     links = soup.find_all('a', href=True)

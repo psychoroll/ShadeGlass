@@ -7,7 +7,6 @@ import threading
 import queue
 import webbrowser  # Added to support web routing links safely
 import re
-import html
 import requests    # Added for fallback backend validation references
 from urllib.parse import urlparse
 from requests.auth import HTTPBasicAuth
@@ -15,29 +14,23 @@ from requests.auth import HTTPBasicAuth
 # Import pipeline components
 from engine import audit_url, load_api_keys, CONFIG_FILE
 from database import save_new_audit, initialize_database
+from report import build_report_html, site_name as report_site_name
+import insights
+import theme as T
+import tkinter.font as tkfont
+import tkinter.messagebox
 
 ctk.set_appearance_mode("Dark")
-ctk.set_default_color_theme("blue")
 
+# Sidebar label -> insights section key
+PANELS = [
+    ("Overview", "overview"),
+    ("On-Page SEO", "onpage"),
+    ("Performance", "performance"),
+    ("Links & Backlinks", "links"),
+    ("Authority & Trust", "authority"),
+]
 
-def fmt_num(value):
-    """1234567 -> '1,234,567'; anything that isn't a number is shown as-is."""
-    if isinstance(value, bool):
-        return str(value)
-    if isinstance(value, int):
-        return f"{value:,}"
-    if isinstance(value, str) and value.isdigit():
-        return f"{int(value):,}"
-    return "N/A" if value is None else str(value)
-
-
-def describe_trend(trend):
-    """{'from': 0.22, 'to': 0.21, ...} -> 'down 0.01 (0.22 in 2025-10 → 0.21 in 2026-10)'"""
-    if not trend:
-        return "Not enough history yet"
-    change = trend["change"]
-    direction = "up" if change > 0 else "down" if change < 0 else "flat"
-    return f"{direction} {abs(change):.2f} ({trend['from']} in {trend['from_date'][:7]} → {trend['to']} in {trend['to_date'][:7]})"
 
 class MarketingApp(ctk.CTk):
     def __init__(self):
@@ -46,12 +39,19 @@ class MarketingApp(ctk.CTk):
 
         # --- Window Settings ---
         self.title("ShadeGlass")
-        self.geometry("1100x700")
-        self.minimum_size = (900, 600)
+        self.geometry("1180x760")
+        self.minsize(900, 600)
+        self.configure(fg_color=T.DEAD_AIR)
+
+        # Brand fonts if installed, otherwise the closest system fonts
+        families = tkfont.families(self)
+        self.font_display = T.pick_font(T.DISPLAY_FONTS, families)
+        self.font_body = T.pick_font(T.BODY_FONTS, families)
+        self.font_mono = T.pick_font(T.MONO_FONTS, families)
 
         # --- Tab State & Custom Workspace Memory ---
-        self.active_tabs = {}       # Tracks individual project data payloads and frame elements [cite: 71]
-        self.tab_buttons = {}       # Tracks references to top bar UI elements for clean state updates
+        self.active_tabs = {}       # Per-project widgets and report data
+        self.tab_buttons = {}       # Tab bar widgets, for restyling on focus and rename
         self.current_visible_tab = None
 
         # Worker threads hand finished audits back to the Tk thread through this queue
@@ -61,25 +61,33 @@ class MarketingApp(ctk.CTk):
         # --- 1. Global Top Menus ---
         self.setup_top_menus()
 
-        # --- 2. Custom Left-Aligned Tab Control Bar Framework ---
-        # Master container for the tab navigation system across the top header row
-        self.top_tab_bar_frame = ctk.CTkFrame(self, height=45, corner_radius=0, fg_color=("gray90", "gray10"))
-        self.top_tab_bar_frame.pack(fill="x", side="top", padx=0, pady=0)
+        # --- 2. Tab bar: brand mark, tabs, then a "+" right after the last tab ---
+        self.top_tab_bar_frame = ctk.CTkFrame(self, height=56, corner_radius=0, fg_color=T.DEAD_AIR_DEEP)
+        self.top_tab_bar_frame.pack(fill="x", side="top")
 
-        # Container inside the top bar that packs buttons horizontally from the left
+        brand = ctk.CTkLabel(self.top_tab_bar_frame, text="shade(glass)", text_color=T.SNOW,
+                             font=ctk.CTkFont(family=self.font_display, size=15, weight="bold"))
+        brand.pack(side="left", padx=(18, 14), pady=12)
+
         self.tabs_container = ctk.CTkFrame(self.top_tab_bar_frame, fg_color="transparent")
-        self.tabs_container.pack(side="left", fill="both", expand=True, padx=5, pady=5)
-        
-        # Quick action button to launch new browser-like workspace blocks [cite: 622]
-        self.add_tab_btn = ctk.CTkButton(self.top_tab_bar_frame, text="+ New Project", width=100, command=self.prompt_new_tab)
-        self.add_tab_btn.pack(side="right", padx=10, pady=8)
+        self.tabs_container.pack(side="left", fill="both", expand=True, pady=10)
+
+        self.add_tab_btn = ctk.CTkButton(
+            self.tabs_container, text="+", width=34, height=32, corner_radius=10,
+            fg_color="transparent", hover_color=T.NOISE, border_width=1, border_color=T.LINE_STRONG,
+            text_color=T.GLITCH, font=ctk.CTkFont(family=self.font_body, size=18, weight="bold"),
+            command=self.prompt_new_tab)
+        self.add_tab_btn.pack(side="left", padx=(4, 0))
+
+        tagline = ctk.CTkLabel(self.top_tab_bar_frame, text="REQLESS ( DESIGN ) CO.", text_color=T.FAINT,
+                               font=ctk.CTkFont(family=self.font_mono, size=10))
+        tagline.pack(side="right", padx=18)
 
         # --- 3. Master Area for Main Dashboard Content Panels ---
         self.main_workspace_container = ctk.CTkFrame(self, fg_color="transparent")
-        self.main_workspace_container.pack(fill="both", expand=True, padx=10, pady=5)
-        
-        # Deploy initial default client staging tab view [cite: 80]
-        self.add_new_project_tab("Default Workspace")
+        self.main_workspace_container.pack(fill="both", expand=True, padx=14, pady=14)
+
+        self.add_new_project_tab("New project")
 
     def setup_top_menus(self):
         menu_bar = tk.Menu(self)
@@ -98,150 +106,137 @@ class MarketingApp(ctk.CTk):
         self.config(menu=menu_bar)
 
     def add_new_project_tab(self, tab_title):
-        """Generates a comprehensive left-aligned tab button widget and isolated workspace panel frame."""
+        """Builds one project workspace (sidebar, URL bar, results) and its tab."""
         if tab_title in self.active_tabs:
             self.focus_project_tab(tab_title)
             return
 
-        # 1. Create a Hidden Workspace Frame for This Project
         tab_frame = ctk.CTkFrame(self.main_workspace_container, fg_color="transparent")
-        
-        # Sidebar Left Framework inside the project workspace
-        sidebar_frame = ctk.CTkFrame(tab_frame, width=160, corner_radius=0)
-        sidebar_frame.pack(side="left", fill="y", padx=5, pady=5)
 
-        sidebar_title = ctk.CTkLabel(sidebar_frame, text="ANALYTICS", font=ctk.CTkFont(size=12, weight="bold"))
-        sidebar_title.pack(padx=10, pady=15)
+        # --- Sidebar ---
+        sidebar_frame = ctk.CTkFrame(tab_frame, width=190, corner_radius=20, fg_color=T.NOISE)
+        sidebar_frame.pack(side="left", fill="y", padx=(0, 14))
+        sidebar_frame.pack_propagate(False)
 
-        # Core Metrics Sidebar - Track buttons in a local dictionary
-        modules = ["Overview", "On-Page SEO", "Performance", "Backlinks & Tech", "Traffic Analytics"]
-        sidebar_btns = {}  # <--- Added to track sidebar elements
-        for mod in modules:
+        ctk.CTkLabel(sidebar_frame, text="( ANALYTICS )", text_color=T.GLITCH,
+                     font=ctk.CTkFont(family=self.font_mono, size=11)).pack(anchor="w", padx=20, pady=(22, 12))
+
+        sidebar_btns = {}
+        for name, _key in PANELS:
             btn = ctk.CTkButton(
-                sidebar_frame, 
-                text=mod, 
-                fg_color="transparent", 
-                text_color=("gray10", "gray90"), 
-                hover_color=("gray70", "gray30"), 
-                anchor="w",
-                command=lambda m=mod, t=tab_title: self.switch_view_panel(t, m)
-            )
+                sidebar_frame, text=name, anchor="w", height=36, corner_radius=10,
+                fg_color="transparent", hover_color=T.NOISE_HOVER, text_color=T.MUTED,
+                font=ctk.CTkFont(family=self.font_body, size=13),
+                command=lambda m=name, t=tab_title: self.switch_view_panel(t, m))
             btn.pack(fill="x", padx=10, pady=2)
-            sidebar_btns[mod] = btn  # <--- Store the reference
+            sidebar_btns[name] = btn
 
-        # Content Output Window Right Frame
-        content_workspace = ctk.CTkFrame(tab_frame, fg_color=("gray95", "gray15"))
-        content_workspace.pack(side="right", fill="both", expand=True, padx=5, pady=5)
+        ctk.CTkLabel(sidebar_frame, text="time to get reqless", text_color=T.FAINT,
+                     font=ctk.CTkFont(family=self.font_mono, size=10)).pack(side="bottom", anchor="w", padx=20, pady=18)
 
-        header_controls = ctk.CTkFrame(content_workspace, height=50)
-        header_controls.pack(fill="x", padx=10, pady=10)
+        # --- Content area ---
+        content_workspace = ctk.CTkFrame(tab_frame, corner_radius=20, fg_color=T.NOISE)
+        content_workspace.pack(side="right", fill="both", expand=True)
 
-        url_input = ctk.CTkEntry(header_controls, placeholder_text="Enter competitor or client URL here...")
-        url_input.pack(side="left", fill="x", expand=True, padx=10, pady=10)
+        header_controls = ctk.CTkFrame(content_workspace, fg_color="transparent")
+        header_controls.pack(fill="x", padx=18, pady=(18, 10))
+
+        url_input = ctk.CTkEntry(
+            header_controls, height=42, corner_radius=12, border_width=1,
+            fg_color=T.DEAD_AIR, border_color=T.LINE_STRONG, text_color=T.SNOW,
+            placeholder_text="Paste a client or competitor URL…", placeholder_text_color=T.FAINT,
+            font=ctk.CTkFont(family=self.font_body, size=14))
+        url_input.pack(side="left", fill="x", expand=True, padx=(0, 10))
         url_input.bind("<Return>", lambda event, t=tab_title: self.trigger_live_audit(t))
 
-        run_btn = ctk.CTkButton(header_controls, text="Run Audit", width=100, command=lambda t=tab_title: self.trigger_live_audit(t))
-        run_btn.pack(side="left", padx=5, pady=10)
+        run_btn = ctk.CTkButton(
+            header_controls, text="run audit →", width=130, height=42, corner_radius=12,
+            fg_color=T.GLITCH, hover_color=T.GLITCH_HOVER, text_color=T.SNOW,
+            text_color_disabled=T.MUTED,
+            font=ctk.CTkFont(family=self.font_body, size=14, weight="bold"),
+            command=lambda t=tab_title: self.trigger_live_audit(t))
+        run_btn.pack(side="left", padx=(0, 8))
 
         export_btn = ctk.CTkButton(
-            header_controls, 
-            text="📤 Export", 
-            width=90, 
-            fg_color="#2b7a3e", 
-            hover_color="#1e542b",
-            command=lambda t=tab_title: self.trigger_report_export(t)
-        )
-        export_btn.pack(side="left", padx=5, pady=10)
+            header_controls, text="export report ↗", width=150, height=42, corner_radius=12,
+            fg_color="transparent", hover_color=T.NOISE_HOVER, border_width=1, border_color=T.CARRIER,
+            text_color=T.SNOW, font=ctk.CTkFont(family=self.font_body, size=14),
+            command=lambda t=tab_title: self.trigger_report_export(t))
+        export_btn.pack(side="left")
 
-        # Main Display Text Terminal Panel
-        display_output = ctk.CTkTextbox(content_workspace, font=ctk.CTkFont(family="Consolas", size=12))
-        display_output.pack(fill="both", expand=True, padx=10, pady=10)
-        display_output.insert("0.0", f"Workspace ready for: {tab_title}\nEnter a target URL and hit 'Run Audit'.")
+        display_output = ctk.CTkTextbox(
+            content_workspace, corner_radius=14, fg_color=T.DEAD_AIR, text_color=T.SNOW,
+            border_width=0, wrap="word", activate_scrollbars=True,
+            scrollbar_button_color=T.LINE_STRONG, scrollbar_button_hover_color=T.FAINT,
+            font=ctk.CTkFont(family=self.font_body, size=13))
+        display_output.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        self._configure_text_tags(display_output)
 
-        # Cache layout memory pointers and tracking state objects
         self.active_tabs[tab_title] = {
             "master_frame": tab_frame,
             "url_input": url_input,
             "display": display_output,
             "last_report_data": None,
             "current_panel": "Overview",
-            "run_btn": run_btn,             # <--- Added
-            "export_btn": export_btn,       # <--- Added
-            "sidebar_btns": sidebar_btns    # <--- Added
+            "run_btn": run_btn,
+            "export_btn": export_btn,
+            "sidebar_btns": sidebar_btns,
         }
 
-        # 2. Build and Render the Left-Aligned Navigation Tab Widget Item
         self.render_tab_button_widget(tab_title)
-        
-        # Shift immediate screen visibility focus directly to this new instance
         self.focus_project_tab(tab_title)
+        self.switch_view_panel(tab_title, "Overview")
 
     def render_tab_button_widget(self, tab_title):
-        """Constructs an aligned horizontal frame container pairing a name link with a rename tool."""
-        widget_wrapper = ctk.CTkFrame(self.tabs_container, fg_color="transparent")
-        widget_wrapper.pack(side="left", padx=3, pady=4) # Left aligned stacking pipeline
+        """One tab: a rounded chip holding the name and, inside it, a small rename pencil."""
+        widget_wrapper = ctk.CTkFrame(self.tabs_container, corner_radius=10, fg_color=T.NOISE,
+                                      border_width=1, border_color=T.LINE_STRONG)
+        widget_wrapper.pack(side="left", padx=(0, 6), before=self.add_tab_btn)
 
-        # Tab Selection Click Button Element
         text_clicker = ctk.CTkButton(
-            widget_wrapper, 
-            text=tab_title, 
-            width=135, 
-            height=28, 
-            fg_color=("gray80", "gray25"), 
-            text_color=("gray10", "gray90"),
-            command=lambda t=tab_title: self.focus_project_tab(t)
-        )
-        text_clicker.pack(side="left")
+            widget_wrapper, text=tab_title, height=28, width=40, corner_radius=8,
+            fg_color=T.NOISE, hover_color=T.NOISE_HOVER, text_color=T.MUTED,
+            font=ctk.CTkFont(family=self.font_body, size=13),
+            command=lambda t=tab_title: self.focus_project_tab(t))
+        text_clicker.pack(side="left", padx=(3, 0), pady=2)
 
-        # Miniature Editing Pencil Icon Button ✏️ (Replaced old gear element)
         pencil_modifier = ctk.CTkButton(
-            widget_wrapper, 
-            text="✏️", 
-            width=26, 
-            height=28, 
-            fg_color=("gray75", "gray30"),
-            hover_color=("gray65", "gray40"),
-            text_color=("gray10", "gray90"),
-            command=lambda t=tab_title: self.prompt_rename_tab(t)
-        )
-        pencil_modifier.pack(side="left", padx=(2, 0))
+            widget_wrapper, text="✎", width=24, height=28, corner_radius=8,
+            fg_color=T.NOISE, hover_color=T.NOISE_HOVER, text_color=T.FAINT,
+            font=ctk.CTkFont(family=self.font_body, size=13),
+            command=lambda t=tab_title: self.prompt_rename_tab(t))
+        pencil_modifier.pack(side="left", padx=(0, 3), pady=2)
 
-        # Maintain references for real-time dynamic switching operations
         self.tab_buttons[tab_title] = {
             "wrapper": widget_wrapper,
             "clicker": text_clicker,
-            "editor": pencil_modifier
+            "editor": pencil_modifier,
         }
 
     def focus_project_tab(self, tab_title):
-        """Manages frame stack indexing states to display the visible target tab workspace."""
+        """Shows the chosen project's workspace and highlights its tab."""
         if self.current_visible_tab == tab_title:
             return
 
-        # Demote coloring of current tab button frame layer
         if self.current_visible_tab and self.current_visible_tab in self.active_tabs:
             self.active_tabs[self.current_visible_tab]["master_frame"].pack_forget()
-            if self.current_visible_tab in self.tab_buttons:
-                self.tab_buttons[self.current_visible_tab]["clicker"].configure(fg_color=("gray80", "gray25"))
+            self._style_tab(self.current_visible_tab, active=False)
 
-        # Elevate targeted project window to grid alignment
         self.current_visible_tab = tab_title
         self.active_tabs[tab_title]["master_frame"].pack(fill="both", expand=True)
-        self.tab_buttons[tab_title]["clicker"].configure(fg_color=("#1f538d", "#1f538d")) # High contrast focus color
+        self._style_tab(tab_title, active=True)
 
     def prompt_rename_tab(self, old_title):
-        """Launches a fast string modal loop window to mutate project workspace signatures."""
-        dialog = ctk.CTkInputDialog(text=f"Modify nickname signature for '{old_title}':", title="Rename Workspace")
-        new_title = dialog.get_input()
-        
+        """Asks for a new tab name."""
+        new_title = self._input_dialog(f"Rename '{old_title}' to:", "Rename project")
+
         if not new_title or new_title.strip() == "" or new_title.strip() == old_title:
             return
-            
+
         new_title = new_title.strip()
 
         if new_title in self.active_tabs:
-            # Prevent namespace collisons across open project tracks
-            tk.messagebox.showwarning("Naming Conflict", f"A project workspace labeled '{new_title}' is already active.")
+            tk.messagebox.showwarning("Name already in use", f"A project called '{new_title}' is already open.")
             return
 
         self.rename_tab(old_title, new_title)
@@ -308,12 +303,10 @@ class MarketingApp(ctk.CTk):
         if tab_data.get("audit_running"):
             return
 
-        display_box = tab_data["display"]
         target_url = tab_data["url_input"].get().strip()
 
         if not target_url:
-            display_box.delete("0.0", "end")
-            display_box.insert("0.0", "⚠️ Error: Please enter a target URL before running an audit loop.")
+            self.show_message(tab_data, "no address yet", "Paste a website address into the box above, then press run audit.", "warn")
             return
 
         # The first successful check renames the tab to the site's domain (e.g. "website.com"),
@@ -325,8 +318,8 @@ class MarketingApp(ctk.CTk):
 
         tab_data["audit_running"] = True
         tab_data["run_btn"].configure(state="disabled")
-        display_box.delete("0.0", "end")
-        display_box.insert("0.0", f"📡 Contacting {target_url} from the outside...\nParsing structural HTML nodes & fetching cloud performance indexes. Please wait...")
+        self.show_message(tab_data, "auditing", f"Reading {target_url} and asking Google PageSpeed, OpenPageRank and DataForSEO about it. "
+                          "Mobile speed tests can take up to a minute.", animate_dots=True)
 
         tab_data["pending_name"] = project_name
         worker_thread = threading.Thread(target=self._async_audit_worker, args=(tab_data, project_name, target_url))
@@ -359,8 +352,7 @@ class MarketingApp(ctk.CTk):
                     # Never let one bad result stop the polling loop, or later audits would hang.
                     tab_data["audit_running"] = False
                     tab_data["run_btn"].configure(state="normal")
-                    tab_data["display"].delete("0.0", "end")
-                    tab_data["display"].insert("0.0", f"❌ Could not display results: {e}")
+                    self.show_message(tab_data, "couldn't show results", str(e), "poor")
         except queue.Empty:
             pass
         finally:
@@ -371,8 +363,7 @@ class MarketingApp(ctk.CTk):
         tab_data["run_btn"].configure(state="normal")
 
         if "error" in report:
-            tab_data["display"].delete("0.0", "end")
-            tab_data["display"].insert("0.0", f"❌ Crawl Blocked:\n{report['error']}")
+            self.show_message(tab_data, "couldn't reach the site", report["error"], "poor")
             return
 
         tab_data["last_report_data"] = report
@@ -393,428 +384,185 @@ class MarketingApp(ctk.CTk):
         tab_memory = self.active_tabs.get(project_name, {})
         display_box = tab_memory.get("display")
         report = tab_memory.get("last_report_data")
-        
         tab_memory["current_panel"] = selected_panel
 
+        # Highlight the active sidebar item
+        for name, btn in tab_memory.get("sidebar_btns", {}).items():
+            active = name == selected_panel
+            btn.configure(fg_color=T.GLITCH_TINT if active else "transparent",
+                          text_color=T.SNOW if active else T.MUTED)
+
+        if tab_memory.get("audit_running"):
+            return  # keep the "auditing..." message up until results arrive
+
         if not report:
-            display_box.delete("0.0", "end")
-            display_box.insert("0.0", f"📌 [{selected_panel.upper()} VIEW PANEL]\nNo active audit loaded yet. Input a URL and click 'Run Audit' to stream live results here.")
+            self.show_message(tab_memory, "ready when you are",
+                              "Paste a website address above and press run audit. "
+                              "Results appear here, and export report builds the client-ready version.")
             return
 
+        display_box.configure(state="normal")
         display_box.delete("0.0", "end")
-        
-        if selected_panel == "Overview":
-            view_text = (
-                f"📊 GLOBAL SITE APPRAISAL OVERVIEW\n"
-                f"====================================================================\n"
-                f"Target Website Address : {report['target_url']}\n"
-                f"Mobile Speed Score     : {report['performance']['score']}  (desktop: {report['performance'].get('desktop_score', 'N/A')})\n"
-                f"Image Assets Evaluated : {report['images']['total_count']} elements\n"
-                f"Total Internal Links   : {report['links']['internal_count']} routing paths\n"
-                f"====================================================================\n\n"
-                f"💡 Quick Strategy Insights:\n"
-                f" • Go to the 'On-Page SEO' panel to review meta tag strategy formatting.\n"
-                f" • Go to the 'Performance' panel to resolve loading speed bottlenecks."
-            )
-        
-        elif selected_panel == "On-Page SEO":
-            headings_block = report["headings"]
-            h1_list = "\n   ├── ".join(headings_block.get("h1", [])) or "None Tagged"
-            h2_list = "\n   ├── ".join(headings_block.get("h2", [])[:5]) or "None Tagged"
-            
-            view_text = (
-                f"📝 TECHNICAL ON-PAGE SEO COMPLIANCE\n"
-                f"====================================================================\n"
-                f"🔹 META DATA VALUES\n"
-                f" ├── Meta Title       : {report['meta']['title'] or 'MISSING'}\n"
-                f" ├── Title Length     : {report['meta']['title_length']} characters (Ideal: 50-60)\n"
-                f" ├── Meta Description : {report['meta']['description'] or 'MISSING'}\n"
-                f" └── Desc Length      : {report['meta']['description_length']} characters (Ideal: 150-160)\n\n"
-                f"🔹 HEADER NODE STRUCTURE HIERARCHY\n"
-                f" H1 Headings Found:\n   ├── {h1_list}\n\n"
-                f" H2 Headings Found (Sample):\n   ├── {h2_list}\n\n"
-                f"🔹 IMAGES OPTIMIZATION AUDIT\n"
-                f" ├── Total Tracked Images : {report['images']['total_count']}\n"
-                f" └── Missing ALT Tags     : {report['images']['missing_alt_count']} VULNERABILITIES"
-            )
+        key = dict(PANELS)[selected_panel]
+        if key == "overview":
+            self._write_overview(display_box, report)
+        else:
+            section = next(s for s in insights.build_sections(report) if s["key"] == key)
+            self._write_section(display_box, section)
+        display_box.configure(state="disabled")
+        display_box.yview_moveto(0)
 
-        elif selected_panel == "Performance":
-            perf = report["performance"]
-            view_text = (
-                f"⚡ GOOGLE PAGESPEED (MOBILE FIRST)\n"
-                f"====================================================================\n"
-                f" ├── Mobile Performance Score  : {perf['score']}   ← what Google ranks on\n"
-                f" └── Desktop Performance Score : {perf.get('desktop_score', 'N/A')}\n\n"
-                f"🔹 LAB TEST (MOBILE)\n"
-                f" ├── Largest Contentful Paint (LCP) : {perf.get('lcp', 'N/A')}   (good: under 2.5 s)\n"
-                f" ├── Cumulative Layout Shift (CLS)  : {perf.get('cls', 'N/A')}   (good: under 0.1)\n"
-                f" ├── First Contentful Paint (FCP)   : {perf.get('fcp', 'N/A')}   (good: under 1.8 s)\n"
-                f" ├── Total Blocking Time (TBT)      : {perf.get('tbt', 'N/A')}   (good: under 200 ms)\n"
-                f" └── Speed Index                    : {perf.get('speed_index', 'N/A')}   (good: under 3.4 s)\n\n"
-            )
+    # ------------------------------------------------------------------ settings
 
-            field = perf.get("field_data")
-            if field and field.get("metrics"):
-                view_text += f"🔹 REAL VISITORS, LAST 28 DAYS ({field['source']}) — overall: {field['overall']}\n"
-                items = list(field["metrics"].items())
-                for i, (label, m) in enumerate(items):
-                    branch = "└──" if i == len(items) - 1 else "├──"
-                    view_text += f" {branch} {label:<26}: {m['value']}  [{m['rating']}]\n"
-                view_text += "\n"
-            elif "field_data" in perf:
-                view_text += "🔹 REAL VISITORS\n └── Not enough Chrome traffic for Google to report real-user data.\n\n"
+    def _style_tab(self, tab_title, active):
+        refs = self.tab_buttons.get(tab_title)
+        if not refs:
+            return
+        refs["wrapper"].configure(border_color=T.GLITCH if active else T.LINE_STRONG)
+        refs["clicker"].configure(text_color=T.SNOW if active else T.MUTED)
+        refs["editor"].configure(text_color=T.GLITCH if active else T.FAINT)
 
-            fixes = perf.get("fixes") or []
-            if fixes:
-                view_text += "🔧 TOP FIXES GOOGLE SUGGESTS (biggest gains first)\n"
-                for i, fix in enumerate(fixes):
-                    branch = "└──" if i == len(fixes) - 1 else "├──"
-                    detail = f" — {fix['detail']}" if fix.get("detail") else ""
-                    view_text += f" {branch} {fix['title']}{detail}\n"
-                view_text += "\n"
+    def _input_dialog(self, text, title):
+        dialog = ctk.CTkInputDialog(
+            text=text, title=title, fg_color=T.DEAD_AIR, text_color=T.SNOW,
+            button_fg_color=T.GLITCH, button_hover_color=T.GLITCH_HOVER, button_text_color=T.SNOW,
+            entry_fg_color=T.NOISE, entry_border_color=T.LINE_STRONG, entry_text_color=T.SNOW,
+            font=ctk.CTkFont(family=self.font_body, size=13))
+        return dialog.get_input()
 
-            view_text += f"Status: {perf['api_status_log']}"
+    def _configure_text_tags(self, box):
+        """Colour and type styles for the results panel (fonts go on the inner Text widget)."""
+        text = box._textbox
+        text.configure(spacing1=2, spacing3=2, padx=20, pady=16, insertbackground=T.SNOW,
+                       selectbackground=T.CARRIER)
+        text.tag_configure("site", font=(self.font_display, 30, "bold"), foreground=T.SNOW, spacing3=4)
+        text.tag_configure("h1", font=(self.font_display, 18, "bold"), foreground=T.SNOW, spacing1=6, spacing3=2)
+        text.tag_configure("h2", font=(self.font_mono, 10, "bold"), foreground=T.MUTED, spacing1=14, spacing3=6)
+        text.tag_configure("kicker", font=(self.font_mono, 10), foreground=T.GLITCH, spacing1=4)
+        text.tag_configure("label", font=(self.font_body, 13, "bold"), foreground=T.SNOW, spacing1=10)
+        text.tag_configure("value", font=(self.font_mono, 12, "bold"), foreground=T.SNOW)
+        text.tag_configure("body", font=(self.font_body, 12), foreground=T.SNOW, lmargin1=18, lmargin2=18)
+        text.tag_configure("muted", font=(self.font_body, 12), foreground=T.MUTED, lmargin1=18, lmargin2=18)
+        text.tag_configure("guide", font=(self.font_mono, 10), foreground=T.FAINT, lmargin1=18, lmargin2=18)
+        text.tag_configure("intro", font=(self.font_body, 12), foreground=T.MUTED, spacing3=8)
+        text.tag_configure("list", font=(self.font_mono, 11), foreground=T.SNOW, lmargin1=18, lmargin2=34)
+        for level, color in T.LEVEL_COLORS.items():
+            text.tag_configure(f"lvl-{level}", font=(self.font_mono, 10, "bold"), foreground=color)
+            text.tag_configure(f"big-{level}", font=(self.font_display, 20, "bold"), foreground=color)
 
-        elif selected_panel == "Backlinks & Tech":
-            dfs = report.get("dataforseo", {})
-            view_text = (
-                f"🔗 LINKS\n"
-                f"====================================================================\n"
-                f"🔹 ON THIS PAGE\n"
-                f" ├── Internal links : {report['links']['internal_count']}\n"
-                f" └── External links : {report['links']['external_count']}\n\n"
-                f"🔹 BACKLINK PROFILE (DataForSEO — other sites linking to this domain)\n"
-            )
-            if dfs.get("status") == "success":
-                view_text += (
-                    f" ├── Total backlinks          : {fmt_num(dfs.get('backlinks'))}\n"
-                    f" ├── Referring domains        : {fmt_num(dfs.get('referring_domains'))}"
-                    f"  ({fmt_num(dfs.get('referring_domains_nofollow'))} nofollow)\n"
-                    f" ├── Unique main domains      : {fmt_num(dfs.get('referring_main_domains'))}\n"
-                    f" ├── Broken backlinks         : {fmt_num(dfs.get('broken_backlinks'))}"
-                    f"   (links to pages that no longer exist; worth redirecting)\n"
-                    f" └── First seen by DataForSEO : {dfs.get('first_seen') or 'N/A'}\n"
-                )
+    def _write(self, box, *parts):
+        """parts: (text, tag) pairs; plain strings are written untagged."""
+        for part in parts:
+            if isinstance(part, tuple):
+                box._textbox.insert("end", part[0], part[1])
             else:
-                view_text += f" └── {dfs.get('error', 'Not configured.')}\n"
+                box._textbox.insert("end", part)
 
-        elif selected_panel == "Traffic Analytics":
-            opr_metrics = report.get("open_pagerank", {})
-            dfs_metrics = report.get("dataforseo", {})
-            
-            view_text = "📊 DOMAIN AUTHORITY & TRUST\n====================================================================\n\n"
-            
-            view_text += "🔵 DATAFORSEO:\n"
-            if dfs_metrics.get("status") == "success":
-                view_text += (
-                    f" ├── Domain Rank          : {fmt_num(dfs_metrics.get('rank'))} / 1000   (higher is better)\n"
-                    f" ├── Backlink Spam Score  : {dfs_metrics.get('backlinks_spam_score')} / 100   (average for linking sites; over 30 needs a look)\n"
-                    f" └── Site Spam Score      : {dfs_metrics.get('target_spam_score')} / 100   (this domain itself)\n\n"
-                )
-            else:
-                view_text += f" └── Status: {dfs_metrics.get('error', 'Not configured.')}\n\n"
+    def show_message(self, tab_data, title, body, level="info", animate_dots=False):
+        box = tab_data["display"]
+        box.configure(state="normal")
+        box.delete("0.0", "end")
+        self._write(box, ("( SHADEGLASS )\n", "kicker"), (title, "h1"))
+        if animate_dots:
+            # Three dots that always take up space; _animate_dots shows or hides each one by colour
+            self._write(box, (".", ("h1", "dot0")), (".", ("h1", "dot1")), (".", ("h1", "dot2")))
+        self._write(box, ("\n", "h1"), (body + "\n", "intro" if level == "info" else f"lvl-{level}"))
+        box.configure(state="disabled")
+        if animate_dots:
+            self._animate_dots(tab_data, 0)
 
-            view_text += "🟢 OPENPAGERANK:\n"
-            if opr_metrics.get("status") == "success":
-                view_text += (
-                    f" ├── PageRank Score    : {opr_metrics.get('score')} / 10   (higher is better)\n"
-                    f" ├── Global Position   : #{fmt_num(opr_metrics.get('rank'))}   (lower is better)\n"
-                    f" ├── Referring Domains : {fmt_num(opr_metrics.get('referring_domains'))}\n"
-                    f" └── Trend (up to 12 mo): {describe_trend(opr_metrics.get('trend'))}\n\n"
-                )
-            else:
-                view_text += f" └── Status: {opr_metrics.get('error', 'Not configured or offline.')}\n\n"
+    def _animate_dots(self, tab_data, frame):
+        """While an audit runs, shows 0, 1, 2, then 3 dots in order, then starts again."""
+        job = tab_data.pop("dots_job", None)
+        if job:
+            self.after_cancel(job)
+        if not tab_data.get("audit_running"):
+            return
+        text = tab_data["display"]._textbox
+        visible = frame % 4
+        for i in range(3):
+            text.tag_configure(f"dot{i}", foreground=T.SNOW if i < visible else T.DEAD_AIR)
+        tab_data["dots_job"] = self.after(350, self._animate_dots, tab_data, frame + 1)
 
-            view_text += "====================================================================\n💡 Strategy Tip: Use these metrics to determine domain trustworthiness and backlink viability."
+    def _append_note(self, tab_data, text, level="info"):
+        """Adds a one-line status note to the bottom of the results panel."""
+        box = tab_data["display"]
+        box.configure(state="normal")
+        self._write(box, "\n", (f"● {text}\n", f"lvl-{level}"))
+        box.configure(state="disabled")
+        box.see("end")
 
-        display_box.insert("0.0", view_text)
+    def _write_item(self, box, it):
+        level = it["level"]
+        self._write(box, (it["label"], "label"), ("   " + str(it["value"]) + "\n", "value"))
+        self._write(box, (f"● {insights.LEVEL_LABELS[level].upper()}", f"lvl-{level}"))
+        if it.get("verdict"):
+            self._write(box, ("  " + it["verdict"], "body"))
+        self._write(box, "\n")
+        if it.get("guide"):
+            self._write(box, (it["guide"] + "\n", "guide"))
+        if it.get("why"):
+            self._write(box, (it["why"] + "\n", "muted"))
+
+    def _write_section(self, box, section):
+        self._write(box, (f"( {section['kicker'].upper()} )\n", "kicker"), (section["title"].lower() + "\n", "h1"),
+                    (section["intro"] + "\n", "intro"))
+        for it in section["items"]:
+            self._write_item(box, it)
+        for group in section["groups"]:
+            if not group["items"] and not group.get("note"):
+                continue
+            self._write(box, (group["title"].upper() + "\n", "h2"))
+            if group.get("note"):
+                self._write(box, (group["note"] + "\n", "muted"))
+            for it in group["items"]:
+                self._write_item(box, it)
+        if section.get("list"):
+            self._write(box, (section["list_title"].upper() + "\n", "h2"), (section["list_note"] + "\n", "muted"))
+            for entry in section["list"]:
+                self._write(box, ("→ " + entry + "\n", "list"))
+        if section.get("status") and section["status"] != "Successfully retrieved cloud metrics.":
+            self._write(box, ("\n" + section["status"] + "\n", "guide"))
+
+    def _write_overview(self, box, report):
+        sections = insights.build_sections(report)
+        summary = insights.summary(report, sections)
+        counts = summary["counts"]
+        name = report_site_name(report.get("target_url", ""))
+
+        self._write(box, ("// SITE AUDIT FOR\n", "kicker"), (name + "\n", "site"),
+                    (report.get("target_url", "") + "\n", "guide"), "\n")
+        self._write(box, (f"● {counts['good']} GOOD", "lvl-good"), "     ",
+                    (f"● {counts['warn']} NEED WORK", "lvl-warn"), "     ",
+                    (f"● {counts['poor']} POOR", "lvl-poor"), "\n")
+
+        for tile in summary["tiles"]:
+            self._write(box, (tile["label"].upper() + "\n", "h2"),
+                        (str(tile["value"]), f"big-{tile['level']}"),
+                        ("   " + insights.LEVEL_LABELS[tile["level"]].upper() + "\n", f"lvl-{tile['level']}"))
+
+        self._write(box, ("\n( PRIORITIES )\n", "kicker"), ("fix these first\n", "h1"))
+        if not summary["priorities"]:
+            self._write(box, ("Every graded check passed.\n", "intro"))
+        for it in summary["priorities"]:
+            self._write(box, (f"● {insights.LEVEL_LABELS[it['level']].upper()}  ", f"lvl-{it['level']}"),
+                        (it["label"], "label"), ("   " + str(it["value"]) + "\n", "value"),
+                        (it["verdict"] + "\n", "muted"))
+        self._write(box, ("\nUse the sidebar for the full detail on each area, or export the client report.\n", "guide"))
 
     def trigger_report_export(self, project_name):
         tab_data = self.active_tabs.get(project_name, {})
         report_data = tab_data.get("last_report_data")
-        display_box = tab_data.get("display")
 
         if not report_data:
-            display_box.insert("end", "\n\n⚠️ Error: No audit data found to export. Run an audit first!")
+            self._append_note(tab_data, "Nothing to export yet. Run an audit first.", "warn")
             return
 
-        filename = f"{project_name.replace(' ', '_')}_Full_SEO_Report.html"
+        # Keep only characters that are safe in a filename on every OS
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", project_name).strip("_") or "report"
+        filename = f"{safe_name}_Full_SEO_Report.html"
+        html_content = build_report_html(project_name, report_data)
 
-        # --- 0. Escape everything that goes into the HTML ---
-        # Titles, descriptions and headings come from third-party sites and must
-        # never be written into the report as raw markup.
-        def escape_all(value):
-            if isinstance(value, str):
-                return html.escape(value, quote=True)
-            if isinstance(value, dict):
-                return {k: escape_all(v) for k, v in value.items()}
-            if isinstance(value, list):
-                return [escape_all(v) for v in value]
-            return value
-
-        report_data = escape_all(report_data)
-        project_name = html.escape(project_name, quote=True)
-
-        # --- 1. Extract all data payloads from the dictionary ---
-        meta = report_data.get("meta", {})
-        perf = report_data.get("performance", {})
-        images = report_data.get("images", {})
-        links = report_data.get("links", {})
-        headings = report_data.get("headings", {})
-        opr_metrics = report_data.get("open_pagerank", {})
-        dfs_metrics = report_data.get("dataforseo", {})
-
-        # Only show numbers when a lookup actually succeeded; otherwise show why it didn't.
-        def lookup_status(metrics):
-            status = metrics.get("status")
-            if status == "success":
-                return True, "Connected", "#10B981"           # Green
-            if status == "skipped" or not metrics:
-                return False, "Not configured", "#94A3B8"     # Grey
-            if status == "not_found":
-                return False, "Not in index yet", "#94A3B8"   # Grey
-            return False, f"Failed: {metrics.get('error', 'Unknown error')}", "#EF4444"  # Red
-
-        def unavailable_or(ok, text):
-            return text if ok else "Unavailable"
-
-        def row(label, value, style=""):
-            style_attr = f' style="{style}"' if style else ""
-            return f'<div class="metric-row"><div class="label">{label}</div><div class="value"{style_attr}>{value}</div></div>'
-
-        dfs_ok, dfs_status_text, dfs_status_color = lookup_status(dfs_metrics)
-        opr_ok, opr_status_text, opr_status_color = lookup_status(opr_metrics)
-        dfs_rank = unavailable_or(dfs_ok, f"{fmt_num(dfs_metrics.get('rank'))} / 1000")
-        dfs_spam = unavailable_or(dfs_ok, f"{dfs_metrics.get('backlinks_spam_score', 'N/A')} / 100")
-        dfs_site_spam = unavailable_or(dfs_ok, f"{dfs_metrics.get('target_spam_score', 'N/A')} / 100")
-        opr_score = unavailable_or(opr_ok, f"{opr_metrics.get('score', 'N/A')} / 10")
-        opr_rank = unavailable_or(opr_ok, f"#{fmt_num(opr_metrics.get('rank'))}")
-        opr_ref_domains = unavailable_or(opr_ok, fmt_num(opr_metrics.get('referring_domains')))
-        opr_trend = unavailable_or(opr_ok, describe_trend(opr_metrics.get('trend')))
-
-        # Backlink profile (DataForSEO)
-        if dfs_ok:
-            backlink_html = (
-                '<h3>Backlink Profile (other sites linking to this domain)</h3><div class="metric-block">'
-                + row("Total Backlinks", fmt_num(dfs_metrics.get("backlinks")))
-                + row("Referring Domains", f"{fmt_num(dfs_metrics.get('referring_domains'))} ({fmt_num(dfs_metrics.get('referring_domains_nofollow'))} nofollow)")
-                + row("Unique Main Domains", fmt_num(dfs_metrics.get("referring_main_domains")))
-                + row("Broken Backlinks", fmt_num(dfs_metrics.get("broken_backlinks")))
-                + row("First Seen", dfs_metrics.get("first_seen") or "N/A")
-                + '<p class="explanation-text"><strong>Significance:</strong> Links from many different, relevant domains are one of the strongest ranking signals. Broken backlinks point at pages that no longer exist; redirecting them recovers lost authority.</p></div>'
-            )
-        else:
-            backlink_html = f'<h3>Backlink Profile</h3><div class="metric-block"><p class="explanation-text">DataForSEO: {dfs_status_text}</p></div>'
-
-        # --- 2. Dynamic Formatting Logic ---
-        def score_color(score_text):
-            """'85/100' -> green/amber/red; status strings like 'Not Configured' -> grey."""
-            match = re.match(r"^(\d+)/100$", str(score_text))
-            if not match:
-                return "#94A3B8"
-            value = int(match.group(1))
-            return "#10B981" if value >= 90 else "#F59E0B" if value >= 50 else "#EF4444"
-
-        # engine.py already formats real scores as "85/100"; anything else is a status string.
-        perf_score_display = str(perf.get('score', 'N/A'))
-        perf_color = score_color(perf_score_display)
-        desktop_score_display = str(perf.get('desktop_score', 'N/A'))
-        desktop_color = score_color(desktop_score_display)
-
-        lab_rows = "".join(
-            row(label, perf.get(key, "N/A"))
-            for label, key in [("Cumulative Layout Shift (CLS)", "cls"), ("First Contentful Paint (FCP)", "fcp"),
-                               ("Total Blocking Time (TBT)", "tbt"), ("Speed Index", "speed_index")]
-            if key in perf
-        )
-
-        field = perf.get("field_data")
-        if field and field.get("metrics"):
-            rating_colors = {"FAST": "#10B981", "AVERAGE": "#F59E0B", "SLOW": "#EF4444"}
-            field_rows = "".join(
-                row(label, f"{m['value']} · {m['rating'].title()}", f"color: {rating_colors.get(m['rating'], '#0F172A')};")
-                for label, m in field["metrics"].items()
-            )
-            field_html = (
-                f'<h3>Real Visitors, Last 28 Days ({field["source"]})</h3><div class="metric-block">{field_rows}'
-                '<p class="explanation-text"><strong>Significance:</strong> Measured on real Chrome users rather than a test run. This is the data Google actually uses for its page experience ranking signal.</p></div>'
-            )
-        elif "field_data" in perf:
-            field_html = '<h3>Real Visitors</h3><div class="metric-block"><p class="explanation-text">Not enough Chrome traffic for Google to report real-user data for this site yet.</p></div>'
-        else:
-            field_html = ""
-
-        fixes = perf.get("fixes") or []
-        if fixes:
-            fix_items = "".join(f"<li>{f['title']}{(' — ' + f['detail']) if f.get('detail') else ''}</li>" for f in fixes)
-            fixes_html = f'<h3>Top Fixes Google Suggests</h3><div class="metric-block"><ul>{fix_items}</ul><p class="explanation-text"><strong>Significance:</strong> Ordered by estimated loading-time savings, biggest first.</p></div>'
-        else:
-            fixes_html = ""
-
-        # --- 3. Build dynamic DOM structure layout ---
-        heading_html_sections = ""
-        for tag_type in sorted(headings.keys()):
-            tag_list = headings.get(tag_type, [])
-            if tag_list:
-                heading_html_sections += f"<h3>{tag_type.upper()} Elements ({len(tag_list)})</h3>"
-                heading_html_sections += f"<p class='explanation-text'>Header tags structure your content. <strong>H1s</strong> act as the book title and should include core target keywords. <strong>H2s</strong> function like book chapters. A broken or non-existent heading hierarchy confuses search engine web crawlers.</p><ul>"
-                for text in tag_list:
-                    heading_html_sections += f"<li>{text}</li>"  # already escaped above
-                heading_html_sections += "</ul>"
-        
-        if not heading_html_sections:
-            heading_html_sections = "<p class='warning-text'>No heading tags (H1-H6) found on this page layout.</p>"
-
-        # --- 4. Master Styled Document Template ---
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <title>Comprehensive Marketing Appraisal - {project_name}</title>
-            <style>
-                body {{ font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; margin: 0; padding: 40px; color: #2C3E50; background-color: #F8F9FA; line-height: 1.6; }}
-                .report-card {{ background: #FFFFFF; padding: 50px; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.05); max-width: 900px; margin: 0 auto; border: 1px solid #E2E8F0; }}
-                .header {{ border-bottom: 4px solid #3B82F6; padding-bottom: 25px; margin-bottom: 40px; }}
-                .header h1 {{ margin: 0; color: #1E3A8A; font-size: 34px; font-weight: 800; letter-spacing: -0.5px; }}
-                .header p {{ margin: 8px 0 0 0; color: #64748B; font-size: 15px; }}
-                .grid-2 {{ display: grid; grid-template-columns: 1fr; gap: 25px; margin-bottom: 30px; }}
-                .section {{ background: #F1F5F9; padding: 25px; border-radius: 10px; border-left: 6px solid #64748B; height: fit-content; }}
-                .sec-meta {{ border-left-color: #3B82F6; }}
-                .sec-perf {{ border-left-color: #EF4444; }}
-                .sec-img {{ border-left-color: #F59E0B; }}
-                .sec-link {{ border-left-color: #10B981; }}
-                .sec-structure {{ border-left-color: #8B5CF6; }}
-                .sec-traffic {{ border-left-color: #0EA5E9; }}
-                h2 {{ margin-top: 0; font-size: 22px; color: #0F172A; font-weight: 700; border-bottom: 1px solid #CBD5E1; padding-bottom: 10px; margin-bottom: 15px; }}
-                h3 {{ font-size: 14px; color: #475569; margin-top: 20px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }}
-                .metric-block {{ background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 6px; padding: 15px; margin-bottom: 15px; }}
-                .metric-row {{ display: flex; justify-content: space-between; font-size: 15px; font-weight: 600; border-bottom: 1px solid #F1F5F9; padding-bottom: 5px; margin-bottom: 5px; }}
-                .label {{ color: #475569; }}
-                .value {{ color: #0F172A; text-align: right; word-break: break-all; max-width: 70%; }}
-                .explanation-text {{ margin: 5px 0 0 0; color: #64748B; font-size: 13px; line-height: 1.4; font-style: italic; font-weight: 400; }}
-                ul {{ margin: 10px 0 0 0; padding-left: 20px; color: #334155; font-size: 13px; }}
-                li {{ margin-bottom: 6px; font-family: monospace; background: #FFF; padding: 4px 8px; border-radius: 4px; border: 1px solid #E2E8F0; list-style-type: none; }}
-                .badge {{ background: #EF4444; color: white; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; }}
-                .badge.pass {{ background: #10B981; }}
-                .warning-text {{ color: #B45309; font-style: italic; font-size: 13px; }}
-                @media print {{ body {{ background: #FFF; padding: 0; }} .report-card {{ box-shadow: none; border: none; max-width: 100%; padding: 0; }} .section {{ margin-bottom: 25px; page-break-inside: avoid; }} }}
-            </style>
-        </head>
-        <body>
-            <div class="report-card">
-                <div class="header">
-                    <h1>Marketing Appraisal & Digital Strategy Audit</h1>
-                    <p>Workspace Client Profile: <strong>{project_name.upper()}</strong></p>
-                    <p>Target Scan Domain: <a href="{report_data['target_url']}" target="_blank" style="color: #3B82F6; text-decoration: none; font-weight: 600;">{report_data['target_url']}</a></p>
-                </div>
-
-                <div class="grid-2">
-                    <div class="section sec-meta">
-                        <h2>📝 Meta Tag Infrastructure</h2>
-                        <div class="metric-block">
-                            <div class="metric-row"><div class="label">Meta Title</div><div class="value">{meta.get('title') or 'MISSING'}</div></div>
-                            <p class="explanation-text"><strong>Significance:</strong> The most critical on-page SEO asset. This is the clickable headline displayed in search engine results.</p>
-                        </div>
-                        <div class="metric-block">
-                            <div class="metric-row"><div class="label">Title Length</div><div class="value">{meta.get('title_length', 0)} characters</div></div>
-                            <p class="explanation-text"><strong>Significance:</strong> Search engines truncate titles after roughly 60 characters.</p>
-                        </div>
-                        <div class="metric-block">
-                            <div class="metric-row"><div class="label">Meta Description</div><div class="value">{meta.get('description') or 'MISSING'}</div></div>
-                            <p class="explanation-text"><strong>Significance:</strong> Acts as ad copy that directly impacts your organic click-through rate (CTR).</p>
-                        </div>
-                        <div class="metric-block">
-                            <div class="metric-row"><div class="label">Description Length</div><div class="value">{meta.get('description_length', 0)} characters</div></div>
-                        </div>
-                    </div>
-
-                    <div class="section sec-perf">
-                        <h2>⚡ Cloud Speed & UX Diagnostics</h2>
-                        <div class="metric-block">
-                            <div class="metric-row"><div class="label">Mobile Performance Score</div><div class="value" style="color: {perf_color};"><strong>{perf_score_display}</strong></div></div>
-                            <div class="metric-row"><div class="label">Desktop Performance Score</div><div class="value" style="color: {desktop_color};"><strong>{desktop_score_display}</strong></div></div>
-                            <p class="explanation-text"><strong>Significance:</strong> Google ranks sites on their mobile version, so the mobile score is the one that counts. Scores below 50 imply heavy visual lag.</p>
-                        </div>
-                        <div class="metric-block">
-                            <div class="metric-row"><div class="label">Largest Contentful Paint (LCP)</div><div class="value">{perf.get('lcp', 'N/A')}</div></div>
-                            {lab_rows}
-                            <p class="explanation-text"><strong>Significance:</strong> Lab test on a simulated mid-range phone. Good targets: LCP under 2.5 s, CLS under 0.1, FCP under 1.8 s, TBT under 200 ms.</p>
-                        </div>
-                        {field_html}
-                        {fixes_html}
-                    </div>
-
-                    <div class="section sec-traffic">
-                        <h2>📈 Domain Authority & Trust</h2>
-
-                        <h3>DataForSEO Engine</h3>
-                        <div class="metric-block">
-                            <div class="metric-row"><div class="label">Domain Rank</div><div class="value">{dfs_rank}</div></div>
-                            <p class="explanation-text"><strong>Significance:</strong> DataForSEO's measure of backlink strength, from 0 to 1000. Higher numbers mean a stronger, more trusted link profile.</p>
-                        </div>
-                        <div class="metric-block">
-                            <div class="metric-row"><div class="label">Backlink Spam Score</div><div class="value">{dfs_spam}</div></div>
-                            <div class="metric-row"><div class="label">Site Spam Score</div><div class="value">{dfs_site_spam}</div></div>
-                            <p class="explanation-text"><strong>Significance:</strong> The backlink score is the average spamminess of the sites linking here; the site score rates this domain itself. Scores above 30 are worth reviewing for low-quality or toxic links.</p>
-                        </div>
-                        <div class="metric-block">
-                            <p class="explanation-text" style="font-style: normal; font-weight: 600;">
-                                🛰️ API Sync Status: <span style="color: {dfs_status_color};">{dfs_status_text}</span>
-                            </p>
-                        </div>
-
-                        <h3>OpenPageRank Engine</h3>
-                        <div class="metric-block">
-                            <div class="metric-row"><div class="label">PageRank Score</div><div class="value">{opr_score}</div></div>
-                            <div class="metric-row"><div class="label">Global Position</div><div class="value">{opr_rank}</div></div>
-                            <div class="metric-row"><div class="label">Referring Domains</div><div class="value">{opr_ref_domains}</div></div>
-                            <div class="metric-row"><div class="label">Trend (up to 12 months)</div><div class="value">{opr_trend}</div></div>
-                            <p class="explanation-text"><strong>Significance:</strong> A 0–10 authority score based on links from across the web (higher is better). Global position ranks every domain it tracks, so lower is better.</p>
-                            <p class="explanation-text" style="font-style: normal; font-weight: 600; margin-top: 10px;">
-                                📡 API Sync Status: <span style="color: {opr_status_color};">{opr_status_text}</span>
-                            </p>
-                        </div>
-                    </div>
-
-                    <div class="section sec-img">
-                        <h2>🖼️ Visual Asset Optimization</h2>
-                        <div class="metric-block">
-                            <div class="metric-row"><div class="label">Total Media Image Blocks</div><div class="value">{images.get('total_count', 0)} assets</div></div>
-                        </div>
-                        <div class="metric-block">
-                            <div class="metric-row">
-                                <div class="label">Missing Alternative Text (Alt Tags)</div>
-                                <div class="value">
-                                    {images.get('missing_alt_count', 0)} vulnerabilities
-                                    {" <span class='badge'>Action Needed</span>" if images.get('missing_alt_count', 0) > 0 else " <span class='badge pass'>Optimized</span>"}
-                                </div>
-                            </div>
-                            <p class="explanation-text"><strong>Significance:</strong> Search engine spiders cannot see images; they read alt text to index visual assets.</p>
-                        </div>
-                    </div>
-
-                    <div class="section sec-link">
-                        <h2>🔗 Links & Backlinks</h2>
-                        <div class="metric-block">
-                            <div class="metric-row"><div class="label">Internal Site Navigation Links</div><div class="value">{links.get('internal_count', 0)} pathways</div></div>
-                            <p class="explanation-text"><strong>Significance:</strong> Internal hyperlinks distribute keyword ranking power across your site.</p>
-                        </div>
-                        <div class="metric-block">
-                            <div class="metric-row"><div class="label">Outbound External Connections</div><div class="value">{links.get('external_count', 0)} hooks</div></div>
-                        </div>
-                        {backlink_html}
-                    </div>
-
-                    <div class="section sec-structure">
-                        <h2>🏗️ Scraped Code Tag Hierarchy Map (DOM Layout)</h2>
-                        {heading_html_sections}
-                    </div>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
         try:
             import os
             import sys
@@ -846,18 +594,16 @@ class MarketingApp(ctk.CTk):
             # --- 5. Open in default browser ---
             webbrowser.open(file_url)
             
-            display_box.insert("end", f"\n\n📤 [Export Completed] Strategy report built at:\n{absolute_file_path}")
+            self._append_note(tab_data, f"Report exported and opened in your browser: {absolute_file_path}", "good")
         except Exception as e:
-            display_box.insert("end", f"\n\n❌ Export Failed: {str(e)}")
+            self._append_note(tab_data, f"Export failed: {e}", "poor")
     
     def prompt_new_tab(self):
-        dialog = ctk.CTkInputDialog(text="Enter Project Name:", title="Create Workspace")
-        name = dialog.get_input()
+        name = self._input_dialog("Name the new project (it switches to the site's domain after the first audit):", "New project")
         if name and name.strip():
-            self.add_new_project_tab(name.strip())
+            self.add_new_project_tab(self._unique_tab_name(name.strip(), None))
 
-    def on_tab_changed(self):
-        pass
+    # ------------------------------------------------------------------ results display
 
     def fetch_open_pagerank(self, domain, config_path="config.json"):
         """Fetches domain authority, referring domains and 12-month trend from OpenPageRank."""
@@ -962,90 +708,66 @@ class MarketingApp(ctk.CTk):
             return {"status": "error", "error": str(e)}
 
     def open_settings_popup(self):
-        """Launches an isolated secondary configuration window..."""
+        """API key settings, styled to match the app."""
+        win = ctk.CTkToplevel(self)
+        win.title("API keys")
+        win.geometry("520x660")
+        win.configure(fg_color=T.DEAD_AIR)
+        win.attributes("-topmost", True)
 
+        def heading(text, link_text, url, top=18):
+            ctk.CTkLabel(win, text=text, text_color=T.SNOW,
+                         font=ctk.CTkFont(family=self.font_display, size=15, weight="bold")).pack(anchor="w", padx=40, pady=(top, 0))
+            link = ctk.CTkLabel(win, text=link_text + " ↗", text_color=T.GLITCH, cursor="hand2",
+                                font=ctk.CTkFont(family=self.font_mono, size=11))
+            link.pack(anchor="w", padx=40, pady=(0, 6))
+            link.bind("<Button-1>", lambda e: webbrowser.open_new_tab(url))
 
-    def open_settings_popup(self):
-        """Launches an isolated secondary configuration window to manage API tokens safely with registration navigation links."""
-        settings_win = ctk.CTkToplevel(self)
-        settings_win.title("Configure API Hooks")
-        settings_win.geometry("500x600") # Increased height to accommodate the new input labels
-        settings_win.attributes("-topmost", True)
+        def field(label, secret=True):
+            ctk.CTkLabel(win, text=label.upper(), text_color=T.FAINT,
+                         font=ctk.CTkFont(family=self.font_mono, size=10)).pack(anchor="w", padx=40)
+            entry = ctk.CTkEntry(win, width=440, height=38, corner_radius=10, border_width=1,
+                                 fg_color=T.NOISE, border_color=T.LINE_STRONG, text_color=T.SNOW,
+                                 show="•" if secret else "", font=ctk.CTkFont(family=self.font_body, size=13))
+            entry.pack(anchor="w", padx=40, pady=(2, 8))
+            return entry
 
-        def open_link(url):
-            webbrowser.open_new_tab(url)
+        ctk.CTkLabel(win, text="( SETTINGS )", text_color=T.GLITCH,
+                     font=ctk.CTkFont(family=self.font_mono, size=11)).pack(anchor="w", padx=40, pady=(26, 0))
+        ctk.CTkLabel(win, text="api keys", text_color=T.SNOW,
+                     font=ctk.CTkFont(family=self.font_display, size=26, weight="bold")).pack(anchor="w", padx=40)
 
-        # ----------------- GOOGLE PAGESPEED CONFIG SECTION -----------------
-        google_label = ctk.CTkLabel(settings_win, text="Google PageSpeed", font=("Arial", 12, "bold"))
-        google_label.pack(pady=(20, 2))
-        
-        google_link = ctk.CTkLabel(settings_win, text="👉 Get Free PageSpeed Key", text_color="#1f538d", cursor="hand2")
-        google_link.pack(pady=(0, 5))
-        google_link.bind("<Button-1>", lambda e: open_link("https://developers.google.com/speed/docs/insights/v5/get-started"))
+        heading("Google PageSpeed", "get a free key", "https://developers.google.com/speed/docs/insights/v5/get-started")
+        google_entry = field("API key")
+        heading("OpenPageRank", "get a free key (starts with opr_live_)", "https://keywordseverywhere.com/account/openpagerank")
+        opr_entry = field("API key")
+        heading("DataForSEO", "create an account (paid per lookup)", "https://dataforseo.com/")
+        dfs_login_entry = field("API login", secret=False)
+        dfs_pass_entry = field("API password")
 
-        # Dedicated Input Label
-        ctk.CTkLabel(settings_win, text="API Key:").pack(anchor="w", padx=75)
-        google_entry = ctk.CTkEntry(settings_win, width=350, show="*")
-        google_entry.pack(pady=(0, 5))
+        current_keys = load_api_keys()
+        google_entry.insert(0, current_keys.get("google_pagespeed_key", ""))
+        opr_entry.insert(0, current_keys.get("open_pagerank_key", ""))
+        dfs_login_entry.insert(0, current_keys.get("dataforseo_login", ""))
+        dfs_pass_entry.insert(0, current_keys.get("dataforseo_password", ""))
 
-        # ----------------- OPENPAGERANK CONFIG SECTION -----------------
-        opr_label = ctk.CTkLabel(settings_win, text="OpenPageRank", font=("Arial", 12, "bold"))
-        opr_label.pack(pady=(15, 2))
-        
-        opr_link = ctk.CTkLabel(settings_win, text="👉 Create Free OpenPageRank Account", text_color="#1f538d", cursor="hand2")
-        opr_link.pack(pady=(0, 5))
-        opr_link.bind("<Button-1>", lambda e: open_link("https://openpagerank.keywordseverywhere.com/"))
-
-        # Dedicated Input Label
-        ctk.CTkLabel(settings_win, text="API Key:").pack(anchor="w", padx=75)
-        opr_entry = ctk.CTkEntry(settings_win, width=350, show="*")
-        opr_entry.pack(pady=(0, 5))
-
-        # ----------------- DATAFORSEO CONFIG SECTION -----------------
-        dfs_label = ctk.CTkLabel(settings_win, text="DataForSEO", font=("Arial", 12, "bold"))
-        dfs_label.pack(pady=(15, 2))
-        
-        dfs_link = ctk.CTkLabel(settings_win, text="👉 Create DataForSEO Account", text_color="#1f538d", cursor="hand2")
-        dfs_link.pack(pady=(0, 5))
-        dfs_link.bind("<Button-1>", lambda e: open_link("https://dataforseo.com/"))
-
-        # Dedicated Input Labels for Login and Password
-        ctk.CTkLabel(settings_win, text="API Login ID:").pack(anchor="w", padx=75)
-        dfs_login_entry = ctk.CTkEntry(settings_win, width=350, placeholder_text="API Login ID")
-        dfs_login_entry.pack(pady=(0, 5))
-        
-        ctk.CTkLabel(settings_win, text="API Password:").pack(anchor="w", padx=75)
-        dfs_pass_entry = ctk.CTkEntry(settings_win, width=350, show="*", placeholder_text="API Password")
-        dfs_pass_entry.pack(pady=(0, 5))
-
-        # ----------------- DATA MANAGEMENT -----------------
-        # Pre-populate keys dynamically if config.json exists
-        if os.path.exists("config.json"):
-            try:
-                with open("config.json", "r") as f:
-                    current_keys = json.load(f)
-                    google_entry.insert(0, current_keys.get("google_pagespeed_key", ""))
-                    opr_entry.insert(0, current_keys.get("open_pagerank_key", ""))
-                    dfs_login_entry.insert(0, current_keys.get("dataforseo_login", ""))
-                    dfs_pass_entry.insert(0, current_keys.get("dataforseo_password", ""))
-            except Exception:
-                pass
-
-        # Save logic capturing all four fields
         def save_keys():
             payload = {
                 "google_pagespeed_key": google_entry.get().strip(),
                 "open_pagerank_key": opr_entry.get().strip(),
                 "dataforseo_login": dfs_login_entry.get().strip(),
-                "dataforseo_password": dfs_pass_entry.get().strip()
+                "dataforseo_password": dfs_pass_entry.get().strip(),
             }
-            with open("config.json", "w") as f:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=4)
-            settings_win.destroy()
+            win.destroy()
 
-        save_btn = ctk.CTkButton(settings_win, text="Save All Keys Securely", command=save_keys, fg_color="#24a0ed")
-        save_btn.pack(pady=25)
-
+        ctk.CTkLabel(win, text="Keys are saved in config.json on this computer only.", text_color=T.FAINT,
+                     font=ctk.CTkFont(family=self.font_body, size=11)).pack(anchor="w", padx=40, pady=(4, 0))
+        ctk.CTkButton(win, text="save keys", width=440, height=42, corner_radius=12,
+                      fg_color=T.GLITCH, hover_color=T.GLITCH_HOVER, text_color=T.SNOW,
+                      font=ctk.CTkFont(family=self.font_body, size=14, weight="bold"),
+                      command=save_keys).pack(anchor="w", padx=40, pady=(10, 20))
 
 if __name__ == "__main__":
     app = MarketingApp()
