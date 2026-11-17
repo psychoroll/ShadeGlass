@@ -4,9 +4,12 @@ import sqlite3
 import json
 import os
 import threading
+import queue
 import webbrowser  # Added to support web routing links safely
 import re
+import html
 import requests    # Added for fallback backend validation references
+from urllib.parse import urlparse
 from requests.auth import HTTPBasicAuth
 
 # Import pipeline components
@@ -15,6 +18,26 @@ from database import save_new_audit, initialize_database
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
+
+
+def fmt_num(value):
+    """1234567 -> '1,234,567'; anything that isn't a number is shown as-is."""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, str) and value.isdigit():
+        return f"{int(value):,}"
+    return "N/A" if value is None else str(value)
+
+
+def describe_trend(trend):
+    """{'from': 0.22, 'to': 0.21, ...} -> 'down 0.01 (0.22 in 2025-10 → 0.21 in 2026-10)'"""
+    if not trend:
+        return "Not enough history yet"
+    change = trend["change"]
+    direction = "up" if change > 0 else "down" if change < 0 else "flat"
+    return f"{direction} {abs(change):.2f} ({trend['from']} in {trend['from_date'][:7]} → {trend['to']} in {trend['to_date'][:7]})"
 
 class MarketingApp(ctk.CTk):
     def __init__(self):
@@ -30,6 +53,10 @@ class MarketingApp(ctk.CTk):
         self.active_tabs = {}       # Tracks individual project data payloads and frame elements [cite: 71]
         self.tab_buttons = {}       # Tracks references to top bar UI elements for clean state updates
         self.current_visible_tab = None
+
+        # Worker threads hand finished audits back to the Tk thread through this queue
+        self._ui_queue = queue.Queue()
+        self.after(100, self._poll_ui_queue)
 
         # --- 1. Global Top Menus ---
         self.setup_top_menus()
@@ -211,12 +238,16 @@ class MarketingApp(ctk.CTk):
             return
             
         new_title = new_title.strip()
-        
+
         if new_title in self.active_tabs:
             # Prevent namespace collisons across open project tracks
             tk.messagebox.showwarning("Naming Conflict", f"A project workspace labeled '{new_title}' is already active.")
             return
 
+        self.rename_tab(old_title, new_title)
+
+    def rename_tab(self, old_title, new_title):
+        """Renames a tab and re-points every callback at the new name. Caller ensures new_title is free."""
         # 1. Pivot Data Reference Maps
         self.active_tabs[new_title] = self.active_tabs.pop(old_title)
         self.tab_buttons[new_title] = self.tab_buttons.pop(old_title)
@@ -248,38 +279,114 @@ class MarketingApp(ctk.CTk):
 
         print(f"Successfully pivoted track context mapping elements from '{old_title}' into '{new_title}'.")
 
-    def trigger_live_audit(self, project_name):
-        worker_thread = threading.Thread(target=self._async_audit_worker, args=(project_name,))
-        worker_thread.daemon = True
-        worker_thread.start()
+    @staticmethod
+    def domain_from_url(url):
+        """'https://www.Website.com:443/page' -> 'website.com'"""
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        host = (urlparse(url).hostname or "").lower()
+        return host[4:] if host.startswith("www.") else host
 
-    def _async_audit_worker(self, project_name):
-        url_box = self.active_tabs[project_name]["url_input"]
-        display_box = self.active_tabs[project_name]["display"]
-        target_url = url_box.get().strip()
+    def _unique_tab_name(self, wanted, tab_data):
+        """Returns wanted, or 'wanted (2)', 'wanted (3)'... if another tab already uses it."""
+        name, n = wanted, 2
+        while name in self.active_tabs and self.active_tabs[name] is not tab_data:
+            name = f"{wanted} ({n})"
+            n += 1
+        return name
+
+    def _tab_name_for(self, tab_data):
+        """Returns the current name of a tab, which may have changed via rename."""
+        for name, data in self.active_tabs.items():
+            if data is tab_data:
+                return name
+        return None
+
+    def trigger_live_audit(self, project_name):
+        # Runs on the Tk main thread: read widgets here, never from the worker.
+        tab_data = self.active_tabs[project_name]
+        if tab_data.get("audit_running"):
+            return
+
+        display_box = tab_data["display"]
+        target_url = tab_data["url_input"].get().strip()
 
         if not target_url:
             display_box.delete("0.0", "end")
             display_box.insert("0.0", "⚠️ Error: Please enter a target URL before running an audit loop.")
             return
 
+        # The first successful check renames the tab to the site's domain (e.g. "website.com"),
+        # so save that first audit under the domain name too.
+        if not tab_data.get("first_check_done"):
+            domain = self.domain_from_url(target_url)
+            if domain:
+                project_name = self._unique_tab_name(domain, tab_data)
+
+        tab_data["audit_running"] = True
+        tab_data["run_btn"].configure(state="disabled")
         display_box.delete("0.0", "end")
         display_box.insert("0.0", f"📡 Contacting {target_url} from the outside...\nParsing structural HTML nodes & fetching cloud performance indexes. Please wait...")
 
-        report = audit_url(target_url)
+        tab_data["pending_name"] = project_name
+        worker_thread = threading.Thread(target=self._async_audit_worker, args=(tab_data, project_name, target_url))
+        worker_thread.daemon = True
+        worker_thread.start()
+
+    def _async_audit_worker(self, tab_data, project_name, target_url):
+        """Network work only. All widget updates are handed back to the main thread via after()."""
+        try:
+            report = audit_url(target_url)
+            if "error" not in report:
+                clean_domain = self.domain_from_url(target_url)
+                report["open_pagerank"] = self.fetch_open_pagerank(clean_domain)
+                report["dataforseo"] = self.fetch_dataforseo(clean_domain)
+                save_new_audit(project_name, target_url, report)
+        except Exception as e:
+            report = {"error": f"Unexpected error during audit: {e}"}
+
+        # Tk calls (including after()) are not safe from this thread; the main
+        # thread picks results up from this queue in _poll_ui_queue.
+        self._ui_queue.put((tab_data, report))
+
+    def _poll_ui_queue(self):
+        try:
+            while True:
+                tab_data, report = self._ui_queue.get_nowait()
+                try:
+                    self._finish_audit(tab_data, report)
+                except Exception as e:
+                    # Never let one bad result stop the polling loop, or later audits would hang.
+                    tab_data["audit_running"] = False
+                    tab_data["run_btn"].configure(state="normal")
+                    tab_data["display"].delete("0.0", "end")
+                    tab_data["display"].insert("0.0", f"❌ Could not display results: {e}")
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self._poll_ui_queue)
+
+    def _finish_audit(self, tab_data, report):
+        tab_data["audit_running"] = False
+        tab_data["run_btn"].configure(state="normal")
 
         if "error" in report:
-            display_box.delete("0.0", "end")
-            display_box.insert("0.0", f"❌ Crawl Blocked:\n{report['error']}")
-        else:
-            # 🚀 INJECT TRAFFIC METRICS HERE BEFORE SAVING
-            clean_domain = target_url.replace("https://", "").replace("http://", "").split("/")[0]
-            report["open_pagerank"] = self.fetch_open_pagerank(clean_domain)
-            report["dataforseo"] = self.fetch_dataforseo(clean_domain)
+            tab_data["display"].delete("0.0", "end")
+            tab_data["display"].insert("0.0", f"❌ Crawl Blocked:\n{report['error']}")
+            return
 
-            save_new_audit(project_name, target_url, report)
-            self.active_tabs[project_name]["last_report_data"] = report
-            self.switch_view_panel(project_name, self.active_tabs[project_name]["current_panel"])
+        tab_data["last_report_data"] = report
+        current_name = self._tab_name_for(tab_data)
+
+        if not tab_data.get("first_check_done"):
+            tab_data["first_check_done"] = True
+            # Re-check for clashes: another tab may have taken the name while this audit ran.
+            new_name = self._unique_tab_name(tab_data.get("pending_name") or current_name, tab_data)
+            if current_name and new_name != current_name:
+                self.rename_tab(current_name, new_name)
+                current_name = new_name
+        if current_name:
+            self.switch_view_panel(current_name, tab_data["current_panel"])
 
 
     def switch_view_panel(self, project_name, selected_panel):
@@ -301,7 +408,7 @@ class MarketingApp(ctk.CTk):
                 f"📊 GLOBAL SITE APPRAISAL OVERVIEW\n"
                 f"====================================================================\n"
                 f"Target Website Address : {report['target_url']}\n"
-                f"Google UX Speed Score  : {report['performance']['score']}\n"
+                f"Mobile Speed Score     : {report['performance']['score']}  (desktop: {report['performance'].get('desktop_score', 'N/A')})\n"
                 f"Image Assets Evaluated : {report['images']['total_count']} elements\n"
                 f"Total Internal Links   : {report['links']['internal_count']} routing paths\n"
                 f"====================================================================\n\n"
@@ -332,53 +439,88 @@ class MarketingApp(ctk.CTk):
             )
 
         elif selected_panel == "Performance":
+            perf = report["performance"]
             view_text = (
-                f"⚡ GOOGLE PERFORMANCE ENGINE & CLOUD METRICS\n"
+                f"⚡ GOOGLE PAGESPEED (MOBILE FIRST)\n"
                 f"====================================================================\n"
-                f" ├── Core Web Vitals Performance Score : {report['performance']['score']}\n"
-                f" ├── Largest Contentful Paint (LCP)    : {report['performance']['lcp']}\n"
-                f" └── Google Cloud Engine Status Log    : {report['performance']['api_status_log']}\n\n"
-                f"💡 Marketing Analysis:\n"
-                f" If LCP scores exceed 2.5 seconds, the page is taking too long to compile\n"
-                f" primary visuals, increasing user drop-off. Compress images and clean\n"
-                f" up render-blocking JavaScript files."
+                f" ├── Mobile Performance Score  : {perf['score']}   ← what Google ranks on\n"
+                f" └── Desktop Performance Score : {perf.get('desktop_score', 'N/A')}\n\n"
+                f"🔹 LAB TEST (MOBILE)\n"
+                f" ├── Largest Contentful Paint (LCP) : {perf.get('lcp', 'N/A')}   (good: under 2.5 s)\n"
+                f" ├── Cumulative Layout Shift (CLS)  : {perf.get('cls', 'N/A')}   (good: under 0.1)\n"
+                f" ├── First Contentful Paint (FCP)   : {perf.get('fcp', 'N/A')}   (good: under 1.8 s)\n"
+                f" ├── Total Blocking Time (TBT)      : {perf.get('tbt', 'N/A')}   (good: under 200 ms)\n"
+                f" └── Speed Index                    : {perf.get('speed_index', 'N/A')}   (good: under 3.4 s)\n\n"
             )
 
+            field = perf.get("field_data")
+            if field and field.get("metrics"):
+                view_text += f"🔹 REAL VISITORS, LAST 28 DAYS ({field['source']}) — overall: {field['overall']}\n"
+                items = list(field["metrics"].items())
+                for i, (label, m) in enumerate(items):
+                    branch = "└──" if i == len(items) - 1 else "├──"
+                    view_text += f" {branch} {label:<26}: {m['value']}  [{m['rating']}]\n"
+                view_text += "\n"
+            elif "field_data" in perf:
+                view_text += "🔹 REAL VISITORS\n └── Not enough Chrome traffic for Google to report real-user data.\n\n"
+
+            fixes = perf.get("fixes") or []
+            if fixes:
+                view_text += "🔧 TOP FIXES GOOGLE SUGGESTS (biggest gains first)\n"
+                for i, fix in enumerate(fixes):
+                    branch = "└──" if i == len(fixes) - 1 else "├──"
+                    detail = f" — {fix['detail']}" if fix.get("detail") else ""
+                    view_text += f" {branch} {fix['title']}{detail}\n"
+                view_text += "\n"
+
+            view_text += f"Status: {perf['api_status_log']}"
+
         elif selected_panel == "Backlinks & Tech":
+            dfs = report.get("dataforseo", {})
             view_text = (
-                f"🔗 LINK ARCHITECTURE & TECHNICAL EXTENSIONS (THE OUTSIDE)\n"
+                f"🔗 LINKS\n"
                 f"====================================================================\n"
-                f" ├── Internal Navigation Hyperlinks : {report['links']['internal_count']} endpoints\n"
-                f" └── Outbound External Escapes      : {report['links']['external_count']} marketing tracking hooks\n\n"
-                f"🛠️ EXTENSIBLE BACKEND HOOKS STAGING\n"
-                f" [Semrush / Ahrefs Domain Authority Integration Loop]\n"
-                f"   ├── Status: Ready to execute.\n"
-                f"   └── Setup: Paste your Semrush developer token into top Settings menu to pull link metrics."
+                f"🔹 ON THIS PAGE\n"
+                f" ├── Internal links : {report['links']['internal_count']}\n"
+                f" └── External links : {report['links']['external_count']}\n\n"
+                f"🔹 BACKLINK PROFILE (DataForSEO — other sites linking to this domain)\n"
             )
+            if dfs.get("status") == "success":
+                view_text += (
+                    f" ├── Total backlinks          : {fmt_num(dfs.get('backlinks'))}\n"
+                    f" ├── Referring domains        : {fmt_num(dfs.get('referring_domains'))}"
+                    f"  ({fmt_num(dfs.get('referring_domains_nofollow'))} nofollow)\n"
+                    f" ├── Unique main domains      : {fmt_num(dfs.get('referring_main_domains'))}\n"
+                    f" ├── Broken backlinks         : {fmt_num(dfs.get('broken_backlinks'))}"
+                    f"   (links to pages that no longer exist; worth redirecting)\n"
+                    f" └── First seen by DataForSEO : {dfs.get('first_seen') or 'N/A'}\n"
+                )
+            else:
+                view_text += f" └── {dfs.get('error', 'Not configured.')}\n"
 
         elif selected_panel == "Traffic Analytics":
             opr_metrics = report.get("open_pagerank", {})
             dfs_metrics = report.get("dataforseo", {})
             
-            view_text = "📊 OFF-PAGE TRAFFIC & AUTHORITY METRICS\n====================================================================\n\n"
+            view_text = "📊 DOMAIN AUTHORITY & TRUST\n====================================================================\n\n"
             
-            # Readout for DataForSEO
-            view_text += "🔵 DATAFORSEO ENGINE:\n"
+            view_text += "🔵 DATAFORSEO:\n"
             if dfs_metrics.get("status") == "success":
                 view_text += (
-                    f" ├── Global Domain Rank : #{dfs_metrics.get('rank')}\n"
-                    f" └── Domain Spam Score  : {dfs_metrics.get('spam_score')} / 100\n\n"
+                    f" ├── Domain Rank          : {fmt_num(dfs_metrics.get('rank'))} / 1000   (higher is better)\n"
+                    f" ├── Backlink Spam Score  : {dfs_metrics.get('backlinks_spam_score')} / 100   (average for linking sites; over 30 needs a look)\n"
+                    f" └── Site Spam Score      : {dfs_metrics.get('target_spam_score')} / 100   (this domain itself)\n\n"
                 )
             else:
                 view_text += f" └── Status: {dfs_metrics.get('error', 'Not configured.')}\n\n"
 
-            # Readout for OpenPageRank (Fallback)
-            view_text += "🟢 OPENPAGERANK ENGINE:\n"
+            view_text += "🟢 OPENPAGERANK:\n"
             if opr_metrics.get("status") == "success":
                 view_text += (
-                    f" ├── Global Domain Rank      : #{opr_metrics.get('rank')}\n"
-                    f" ├── Integrity Integer Score : {opr_metrics.get('page_rank_integer')} / 10\n"
-                    f" └── PageRank Decimal Rating : {opr_metrics.get('page_rank_decimal')} / 10\n\n"
+                    f" ├── PageRank Score    : {opr_metrics.get('score')} / 10   (higher is better)\n"
+                    f" ├── Global Position   : #{fmt_num(opr_metrics.get('rank'))}   (lower is better)\n"
+                    f" ├── Referring Domains : {fmt_num(opr_metrics.get('referring_domains'))}\n"
+                    f" └── Trend (up to 12 mo): {describe_trend(opr_metrics.get('trend'))}\n\n"
                 )
             else:
                 view_text += f" └── Status: {opr_metrics.get('error', 'Not configured or offline.')}\n\n"
@@ -397,7 +539,22 @@ class MarketingApp(ctk.CTk):
             return
 
         filename = f"{project_name.replace(' ', '_')}_Full_SEO_Report.html"
-        
+
+        # --- 0. Escape everything that goes into the HTML ---
+        # Titles, descriptions and headings come from third-party sites and must
+        # never be written into the report as raw markup.
+        def escape_all(value):
+            if isinstance(value, str):
+                return html.escape(value, quote=True)
+            if isinstance(value, dict):
+                return {k: escape_all(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [escape_all(v) for v in value]
+            return value
+
+        report_data = escape_all(report_data)
+        project_name = html.escape(project_name, quote=True)
+
         # --- 1. Extract all data payloads from the dictionary ---
         meta = report_data.get("meta", {})
         perf = report_data.get("performance", {})
@@ -407,16 +564,92 @@ class MarketingApp(ctk.CTk):
         opr_metrics = report_data.get("open_pagerank", {})
         dfs_metrics = report_data.get("dataforseo", {})
 
-        # --- 2. Dynamic Formatting Logic ---
-        perf_score_raw = perf.get('score', 'N/A')
-        
-        # Check if the score is a string indicating a skipped/failed API call
-        if str(perf_score_raw) in ["Not Configured", "N/A", "None"]:
-            perf_score_display = str(perf_score_raw)
-            perf_color = "#94A3B8"  # Slate/Grey for inactive metrics
+        # Only show numbers when a lookup actually succeeded; otherwise show why it didn't.
+        def lookup_status(metrics):
+            status = metrics.get("status")
+            if status == "success":
+                return True, "Connected", "#10B981"           # Green
+            if status == "skipped" or not metrics:
+                return False, "Not configured", "#94A3B8"     # Grey
+            if status == "not_found":
+                return False, "Not in index yet", "#94A3B8"   # Grey
+            return False, f"Failed: {metrics.get('error', 'Unknown error')}", "#EF4444"  # Red
+
+        def unavailable_or(ok, text):
+            return text if ok else "Unavailable"
+
+        def row(label, value, style=""):
+            style_attr = f' style="{style}"' if style else ""
+            return f'<div class="metric-row"><div class="label">{label}</div><div class="value"{style_attr}>{value}</div></div>'
+
+        dfs_ok, dfs_status_text, dfs_status_color = lookup_status(dfs_metrics)
+        opr_ok, opr_status_text, opr_status_color = lookup_status(opr_metrics)
+        dfs_rank = unavailable_or(dfs_ok, f"{fmt_num(dfs_metrics.get('rank'))} / 1000")
+        dfs_spam = unavailable_or(dfs_ok, f"{dfs_metrics.get('backlinks_spam_score', 'N/A')} / 100")
+        dfs_site_spam = unavailable_or(dfs_ok, f"{dfs_metrics.get('target_spam_score', 'N/A')} / 100")
+        opr_score = unavailable_or(opr_ok, f"{opr_metrics.get('score', 'N/A')} / 10")
+        opr_rank = unavailable_or(opr_ok, f"#{fmt_num(opr_metrics.get('rank'))}")
+        opr_ref_domains = unavailable_or(opr_ok, fmt_num(opr_metrics.get('referring_domains')))
+        opr_trend = unavailable_or(opr_ok, describe_trend(opr_metrics.get('trend')))
+
+        # Backlink profile (DataForSEO)
+        if dfs_ok:
+            backlink_html = (
+                '<h3>Backlink Profile (other sites linking to this domain)</h3><div class="metric-block">'
+                + row("Total Backlinks", fmt_num(dfs_metrics.get("backlinks")))
+                + row("Referring Domains", f"{fmt_num(dfs_metrics.get('referring_domains'))} ({fmt_num(dfs_metrics.get('referring_domains_nofollow'))} nofollow)")
+                + row("Unique Main Domains", fmt_num(dfs_metrics.get("referring_main_domains")))
+                + row("Broken Backlinks", fmt_num(dfs_metrics.get("broken_backlinks")))
+                + row("First Seen", dfs_metrics.get("first_seen") or "N/A")
+                + '<p class="explanation-text"><strong>Significance:</strong> Links from many different, relevant domains are one of the strongest ranking signals. Broken backlinks point at pages that no longer exist; redirecting them recovers lost authority.</p></div>'
+            )
         else:
-            perf_score_display = f"{perf_score_raw}/100"
-            perf_color = "#EF4444"  # Red for active metrics
+            backlink_html = f'<h3>Backlink Profile</h3><div class="metric-block"><p class="explanation-text">DataForSEO: {dfs_status_text}</p></div>'
+
+        # --- 2. Dynamic Formatting Logic ---
+        def score_color(score_text):
+            """'85/100' -> green/amber/red; status strings like 'Not Configured' -> grey."""
+            match = re.match(r"^(\d+)/100$", str(score_text))
+            if not match:
+                return "#94A3B8"
+            value = int(match.group(1))
+            return "#10B981" if value >= 90 else "#F59E0B" if value >= 50 else "#EF4444"
+
+        # engine.py already formats real scores as "85/100"; anything else is a status string.
+        perf_score_display = str(perf.get('score', 'N/A'))
+        perf_color = score_color(perf_score_display)
+        desktop_score_display = str(perf.get('desktop_score', 'N/A'))
+        desktop_color = score_color(desktop_score_display)
+
+        lab_rows = "".join(
+            row(label, perf.get(key, "N/A"))
+            for label, key in [("Cumulative Layout Shift (CLS)", "cls"), ("First Contentful Paint (FCP)", "fcp"),
+                               ("Total Blocking Time (TBT)", "tbt"), ("Speed Index", "speed_index")]
+            if key in perf
+        )
+
+        field = perf.get("field_data")
+        if field and field.get("metrics"):
+            rating_colors = {"FAST": "#10B981", "AVERAGE": "#F59E0B", "SLOW": "#EF4444"}
+            field_rows = "".join(
+                row(label, f"{m['value']} · {m['rating'].title()}", f"color: {rating_colors.get(m['rating'], '#0F172A')};")
+                for label, m in field["metrics"].items()
+            )
+            field_html = (
+                f'<h3>Real Visitors, Last 28 Days ({field["source"]})</h3><div class="metric-block">{field_rows}'
+                '<p class="explanation-text"><strong>Significance:</strong> Measured on real Chrome users rather than a test run. This is the data Google actually uses for its page experience ranking signal.</p></div>'
+            )
+        elif "field_data" in perf:
+            field_html = '<h3>Real Visitors</h3><div class="metric-block"><p class="explanation-text">Not enough Chrome traffic for Google to report real-user data for this site yet.</p></div>'
+        else:
+            field_html = ""
+
+        fixes = perf.get("fixes") or []
+        if fixes:
+            fix_items = "".join(f"<li>{f['title']}{(' — ' + f['detail']) if f.get('detail') else ''}</li>" for f in fixes)
+            fixes_html = f'<h3>Top Fixes Google Suggests</h3><div class="metric-block"><ul>{fix_items}</ul><p class="explanation-text"><strong>Significance:</strong> Ordered by estimated loading-time savings, biggest first.</p></div>'
+        else:
+            fixes_html = ""
 
         # --- 3. Build dynamic DOM structure layout ---
         heading_html_sections = ""
@@ -426,8 +659,7 @@ class MarketingApp(ctk.CTk):
                 heading_html_sections += f"<h3>{tag_type.upper()} Elements ({len(tag_list)})</h3>"
                 heading_html_sections += f"<p class='explanation-text'>Header tags structure your content. <strong>H1s</strong> act as the book title and should include core target keywords. <strong>H2s</strong> function like book chapters. A broken or non-existent heading hierarchy confuses search engine web crawlers.</p><ul>"
                 for text in tag_list:
-                    safe_text = text.replace("<", "&lt;").replace(">", "&gt;")
-                    heading_html_sections += f"<li>{safe_text}</li>"
+                    heading_html_sections += f"<li>{text}</li>"  # already escaped above
                 heading_html_sections += "</ul>"
         
         if not heading_html_sections:
@@ -500,40 +732,47 @@ class MarketingApp(ctk.CTk):
                     <div class="section sec-perf">
                         <h2>⚡ Cloud Speed & UX Diagnostics</h2>
                         <div class="metric-block">
-                            <div class="metric-row"><div class="label">Google Performance Score</div><div class="value" style="color: {perf_color};"><strong>{perf_score_display}</strong></div></div>
-                            <p class="explanation-text"><strong>Significance:</strong> Google's direct optimization metric. Scores below 50 imply heavy visual lag.</p>
+                            <div class="metric-row"><div class="label">Mobile Performance Score</div><div class="value" style="color: {perf_color};"><strong>{perf_score_display}</strong></div></div>
+                            <div class="metric-row"><div class="label">Desktop Performance Score</div><div class="value" style="color: {desktop_color};"><strong>{desktop_score_display}</strong></div></div>
+                            <p class="explanation-text"><strong>Significance:</strong> Google ranks sites on their mobile version, so the mobile score is the one that counts. Scores below 50 imply heavy visual lag.</p>
                         </div>
                         <div class="metric-block">
                             <div class="metric-row"><div class="label">Largest Contentful Paint (LCP)</div><div class="value">{perf.get('lcp', 'N/A')}</div></div>
-                            <p class="explanation-text"><strong>Significance:</strong> A critical Core Web Vital tracking primary visual load times.</p>
+                            {lab_rows}
+                            <p class="explanation-text"><strong>Significance:</strong> Lab test on a simulated mid-range phone. Good targets: LCP under 2.5 s, CLS under 0.1, FCP under 1.8 s, TBT under 200 ms.</p>
                         </div>
+                        {field_html}
+                        {fixes_html}
                     </div>
-                    
+
                     <div class="section sec-traffic">
-                        <h2>📈 Traffic Analytics & Domain Authority</h2>
-                        
+                        <h2>📈 Domain Authority & Trust</h2>
+
                         <h3>DataForSEO Engine</h3>
                         <div class="metric-block">
-                            <div class="metric-row"><div class="label">Global Domain Rank</div><div class="value">#{dfs_metrics.get('rank', 'N/A')}</div></div>
-                            <p class="explanation-text"><strong>Significance:</strong> An authoritative indicator of backlink power. Lower numbers represent higher structural trust and greater visibility across search engine ecosystems.</p>
+                            <div class="metric-row"><div class="label">Domain Rank</div><div class="value">{dfs_rank}</div></div>
+                            <p class="explanation-text"><strong>Significance:</strong> DataForSEO's measure of backlink strength, from 0 to 1000. Higher numbers mean a stronger, more trusted link profile.</p>
                         </div>
                         <div class="metric-block">
-                            <div class="metric-row"><div class="label">Spam Score</div><div class="value">{dfs_metrics.get('spam_score', 'N/A')} / 100</div></div>
-                            <p class="explanation-text"><strong>Significance:</strong> Measures the volume of low-quality, toxic, or penalized incoming backlinks. Scores above 30% warrant immediate link detoxification profiles to preserve keyword rankings.</p>
+                            <div class="metric-row"><div class="label">Backlink Spam Score</div><div class="value">{dfs_spam}</div></div>
+                            <div class="metric-row"><div class="label">Site Spam Score</div><div class="value">{dfs_site_spam}</div></div>
+                            <p class="explanation-text"><strong>Significance:</strong> The backlink score is the average spamminess of the sites linking here; the site score rates this domain itself. Scores above 30 are worth reviewing for low-quality or toxic links.</p>
                         </div>
                         <div class="metric-block">
                             <p class="explanation-text" style="font-style: normal; font-weight: 600;">
-                                🛰️ API Sync Status: <span style="color: #0EA5E9;">{dfs_metrics.get('status', 'Not Configured')} {dfs_metrics.get('error', '')}</span>
+                                🛰️ API Sync Status: <span style="color: {dfs_status_color};">{dfs_status_text}</span>
                             </p>
                         </div>
 
                         <h3>OpenPageRank Engine</h3>
                         <div class="metric-block">
-                            <div class="metric-row"><div class="label">Global Rank</div><div class="value">#{opr_metrics.get('rank', 'N/A')}</div></div>
-                            <div class="metric-row"><div class="label">PageRank Integer</div><div class="value">{opr_metrics.get('page_rank_integer', 'N/A')} / 10</div></div>
-                            <p class="explanation-text"><strong>Significance:</strong> A public evaluation algorithm parsing macro domain link weight distribution across millions of websites natively.</p>
+                            <div class="metric-row"><div class="label">PageRank Score</div><div class="value">{opr_score}</div></div>
+                            <div class="metric-row"><div class="label">Global Position</div><div class="value">{opr_rank}</div></div>
+                            <div class="metric-row"><div class="label">Referring Domains</div><div class="value">{opr_ref_domains}</div></div>
+                            <div class="metric-row"><div class="label">Trend (up to 12 months)</div><div class="value">{opr_trend}</div></div>
+                            <p class="explanation-text"><strong>Significance:</strong> A 0–10 authority score based on links from across the web (higher is better). Global position ranks every domain it tracks, so lower is better.</p>
                             <p class="explanation-text" style="font-style: normal; font-weight: 600; margin-top: 10px;">
-                                📡 API Sync Status: <span style="color: #10B981;">{opr_metrics.get('status', 'Not Configured')} {opr_metrics.get('error', '')}</span>
+                                📡 API Sync Status: <span style="color: {opr_status_color};">{opr_status_text}</span>
                             </p>
                         </div>
                     </div>
@@ -556,7 +795,7 @@ class MarketingApp(ctk.CTk):
                     </div>
 
                     <div class="section sec-link">
-                        <h2>🔗 Interconnected Links Architecture</h2>
+                        <h2>🔗 Links & Backlinks</h2>
                         <div class="metric-block">
                             <div class="metric-row"><div class="label">Internal Site Navigation Links</div><div class="value">{links.get('internal_count', 0)} pathways</div></div>
                             <p class="explanation-text"><strong>Significance:</strong> Internal hyperlinks distribute keyword ranking power across your site.</p>
@@ -564,6 +803,7 @@ class MarketingApp(ctk.CTk):
                         <div class="metric-block">
                             <div class="metric-row"><div class="label">Outbound External Connections</div><div class="value">{links.get('external_count', 0)} hooks</div></div>
                         </div>
+                        {backlink_html}
                     </div>
 
                     <div class="section sec-structure">
@@ -620,87 +860,103 @@ class MarketingApp(ctk.CTk):
         pass
 
     def fetch_open_pagerank(self, domain, config_path="config.json"):
-        """Fetches free domain authority and ranking metrics from the OpenPageRank API."""
-        if os.path.exists(config_path):
-            with open(config_path, "r") as f:
-                config = json.load(f)
-        else:
-            config = {}
-
-        api_key = config.get("open_pagerank_key", "")
+        """Fetches domain authority, referring domains and 12-month trend from OpenPageRank."""
+        api_key = load_api_keys().get("open_pagerank_key", "").strip()
         if not api_key:
             return {"status": "skipped", "error": "No OpenPageRank API Key configured."}
 
-        url = f"https://openpagerank.com/api/v1.0/getPageRank?domains[]={domain}"
-        headers = {"API-OPR": api_key}
+        url = "https://openpagerank.keywordseverywhere.com/v1/domains/bulk"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {"domains": [domain], "include_history": True}
 
         try:
-            response = requests.get(url, headers=headers, timeout=15)
-            if response.status_code == 200:
+            response = requests.post(url, json=payload, headers=headers, timeout=20)
+            try:
                 data = response.json()
-                if data.get("status_code") == 200:
-                    results = data.get("response", [])
-                    if results:
-                        domain_info = results[0]
-                        return {
-                            "status": "success",
-                            "page_rank_integer": domain_info.get("page_rank_integer", "N/A"),
-                            "page_rank_decimal": domain_info.get("page_rank_decimal", "N/A"),
-                            "rank": domain_info.get("rank", "N/A")
-                        }
+            except ValueError:
+                data = {}
+
+            if response.status_code != 200:
+                error = data.get("error") if isinstance(data, dict) else None
+                if isinstance(error, dict):
+                    reason = error.get("message", "")
+                    if error.get("type") == "address_error":
+                        reason += " Free keys only work from the IP address set on your OpenPageRank account page."
+                else:
+                    reason = error or ""
+                return {"status": "error", "error": f"HTTP {response.status_code}: {reason}".rstrip(": ")}
+
+            results = data.get("results") or []
+            if not results:
                 return {"status": "error", "error": "Invalid API data format structure."}
-            else:
-                return {"status": "error", "error": f"HTTP Error: {response.status_code}"}
+            info = results[0]
+            if not info.get("found"):
+                return {"status": "not_found", "error": "Domain is not in OpenPageRank's index yet."}
+
+            # Monthly history, oldest first. Keep the last 3 years and work out the 12-month change.
+            history = sorted(info.get("history") or [], key=lambda h: h.get("date", ""))
+            history = [{"date": h["date"], "score": h.get("open_page_rank")} for h in history if h.get("date")][-36:]
+            trend = None
+            if len(history) >= 2:
+                latest = history[-1]
+                year_ago_date = f"{int(latest['date'][:4]) - 1}{latest['date'][4:]}"
+                earlier = [h for h in history if h["date"] <= year_ago_date] or history[:1]
+                start = earlier[-1]
+                if start["score"] is not None and latest["score"] is not None:
+                    trend = {"from_date": start["date"], "from": start["score"],
+                             "to_date": latest["date"], "to": latest["score"],
+                             "change": round(latest["score"] - start["score"], 2)}
+
+            return {
+                "status": "success",
+                "score": info.get("open_page_rank", "N/A"),          # 0-10, higher is better
+                "rank": info.get("rank", "N/A"),                     # global position, lower is better
+                "referring_domains": info.get("referring_domains", "N/A"),
+                "as_of": data.get("as_of", ""),
+                "trend": trend,
+                "history": history,
+            }
         except requests.exceptions.RequestException as e:
-            return {"status": "error", "error": f"Connection Timed Out: {str(e)}"}
+            return {"status": "error", "error": f"Connection failed: {type(e).__name__}"}
 
     def fetch_dataforseo(self, domain, config_path="config.json"):
-        """
-        Clean, spacebar-indented function to prevent PowerShell compilation crashes.
-        """
-        config = self.load_api_keys() if hasattr(self, 'load_api_keys') else load_api_keys()
+        """Fetches domain rank, spam scores and the backlink profile from DataForSEO (paid per call)."""
+        config = load_api_keys()
         api_login = config.get("dataforseo_login", "")
         api_password = config.get("dataforseo_password", "")
 
         if not api_login or not api_password:
-            return {"status": "error", "error": "DataForSEO credentials missing."}
+            return {"status": "skipped", "error": "DataForSEO credentials missing."}
 
-        # Correct endpoint for domain rank and spam metrics
         url = "https://api.dataforseo.com/v3/backlinks/summary/live"
-        
-        # Scrub domain down to its root
-        clean_domain = domain.strip()
-        clean_domain = clean_domain.replace("https://", "").replace("http://", "").replace("www.", "")
-        clean_domain = clean_domain.split('/')[0]
-        
-        payload = [{
-            "target": clean_domain
-        }]
-        
+        payload = [{"target": domain}]
+
         try:
-            response = requests.post(
-                url, 
-                json=payload, 
-                auth=HTTPBasicAuth(api_login, api_password), 
-                timeout=15
-            )
+            response = requests.post(url, json=payload, auth=HTTPBasicAuth(api_login, api_password), timeout=30)
             data = response.json()
-            
+
             if response.status_code == 200:
                 tasks = data.get("tasks", [])
                 if tasks and tasks[0].get("status_code") == 20000:
-                    result = tasks[0].get("result", [{}])[0]
+                    result = (tasks[0].get("result") or [{}])[0] or {}
                     return {
-                        "status": "success", 
-                        "rank": result.get("rank", "N/A"),
-                        "spam_score": result.get("spam_score", "0")
+                        "status": "success",
+                        "rank": result.get("rank", "N/A"),                        # 0-1000, higher is better
+                        "backlinks_spam_score": result.get("backlinks_spam_score", "N/A"),
+                        "target_spam_score": (result.get("info") or {}).get("target_spam_score", "N/A"),
+                        "backlinks": result.get("backlinks", "N/A"),
+                        "referring_domains": result.get("referring_domains", "N/A"),
+                        "referring_main_domains": result.get("referring_main_domains", "N/A"),
+                        "referring_domains_nofollow": result.get("referring_domains_nofollow", "N/A"),
+                        "broken_backlinks": result.get("broken_backlinks", "N/A"),
+                        "first_seen": (result.get("first_seen") or "")[:10],
                     }
                 elif tasks:
                     return {
-                        "status": "error", 
+                        "status": "error",
                         "error": f"{tasks[0].get('status_message', 'Error')} (Code: {tasks[0].get('status_code')})"
                     }
-            
+
             return {"status": "error", "error": f"HTTP {response.status_code}"}
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -738,7 +994,7 @@ class MarketingApp(ctk.CTk):
         
         opr_link = ctk.CTkLabel(settings_win, text="👉 Create Free OpenPageRank Account", text_color="#1f538d", cursor="hand2")
         opr_link.pack(pady=(0, 5))
-        opr_link.bind("<Button-1>", lambda e: open_link("https://www.openpagerank.com/"))
+        opr_link.bind("<Button-1>", lambda e: open_link("https://openpagerank.keywordseverywhere.com/"))
 
         # Dedicated Input Label
         ctk.CTkLabel(settings_win, text="API Key:").pack(anchor="w", padx=75)

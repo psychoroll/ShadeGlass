@@ -1,6 +1,8 @@
 import json
 import os
+import re
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
@@ -19,30 +21,98 @@ def load_api_keys():
             return {}
     return {}
 
-def fetch_google_pagespeed(target_url, api_key):
-    """Queries official Google PageSpeed cloud APIs for speed scores and Web Vitals."""
+PSI_LAB_METRICS = {
+    "lcp": "largest-contentful-paint",
+    "cls": "cumulative-layout-shift",
+    "fcp": "first-contentful-paint",
+    "tbt": "total-blocking-time",
+    "speed_index": "speed-index",
+}
+
+# Real-visitor (Chrome UX Report) metrics as PageSpeed names them -> (label, formatter)
+PSI_FIELD_METRICS = {
+    "LARGEST_CONTENTFUL_PAINT_MS": ("Largest Contentful Paint", lambda v: f"{v / 1000:.1f} s"),
+    "INTERACTION_TO_NEXT_PAINT": ("Interaction to Next Paint", lambda v: f"{v} ms"),
+    "CUMULATIVE_LAYOUT_SHIFT_SCORE": ("Cumulative Layout Shift", lambda v: f"{v / 100:.2f}"),
+    "FIRST_CONTENTFUL_PAINT_MS": ("First Contentful Paint", lambda v: f"{v / 1000:.1f} s"),
+    "EXPERIMENTAL_TIME_TO_FIRST_BYTE": ("Time to First Byte", lambda v: f"{v / 1000:.2f} s"),
+}
+
+def _parse_field_data(data):
+    """Real Chrome-user measurements, if Google has enough traffic data for this page or site."""
+    for key, source in (("loadingExperience", "this page"), ("originLoadingExperience", "whole site")):
+        experience = data.get(key) or {}
+        metrics = experience.get("metrics") or {}
+        if not metrics:
+            continue
+        if key == "loadingExperience" and experience.get("origin_fallback"):
+            source = "whole site"
+        parsed = {}
+        for api_name, (label, fmt) in PSI_FIELD_METRICS.items():
+            metric = metrics.get(api_name)
+            if metric and metric.get("percentile") is not None:
+                parsed[label] = {"value": fmt(metric["percentile"]), "rating": metric.get("category", "N/A")}
+        return {"source": source, "overall": experience.get("overall_category", "N/A"), "metrics": parsed}
+    return None
+
+def _parse_fixes(audits, limit=5):
+    """Google's own suggested fixes that are failing, biggest estimated time savings first."""
+    fixes = []
+    for audit in audits.values():
+        if audit.get("scoreDisplayMode") != "metricSavings":
+            continue
+        score = audit.get("score")
+        if score is None or score >= 0.9:
+            continue
+        savings_ms = sum(v for v in (audit.get("metricSavings") or {}).values() if isinstance(v, (int, float)))
+        detail = audit.get("displayValue", "")
+        if savings_ms == 0 and re.search(r"\b0\s*(KiB|ms)$", detail):
+            continue  # "Est savings of 0 KiB" is noise, not a fix
+        fixes.append({"title": audit.get("title", ""), "detail": audit.get("displayValue", ""), "savings_ms": savings_ms})
+    fixes.sort(key=lambda f: f["savings_ms"], reverse=True)
+    return fixes[:limit]
+
+def fetch_google_pagespeed(target_url, api_key, strategy="mobile", timeout=90):
+    """Queries Google PageSpeed for one device type ("mobile" or "desktop")."""
     # Ensure a clean tracking URL schema for external cloud request loops
     if not target_url.startswith(('http://', 'https://')):
         target_url = 'https://' + target_url
-        
-    endpoint = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={target_url}&key={api_key}&category=performance"
-    
+
+    # Pass the key and target via params so they are URL-encoded, and so the key
+    # never appears in a hand-built URL that requests would echo into error messages.
+    endpoint = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+    params = {"url": target_url, "key": api_key, "category": "performance", "strategy": strategy}
+
+    def scrub(text):
+        return text.replace(api_key, "***") if api_key else text
+
     try:
-        response = requests.get(endpoint, timeout=45)
-        if response.status_code == 200:
-            data = response.json()
-            # Parse metrics from the cloud response payload
-            lighthouse = data.get('lighthouseResult', {})
-            score = lighthouse.get('categories', {}).get('performance', {}).get('score', 0) * 100
-            
-            # Extract Core Web Vital: Largest Contentful Paint (LCP)
-            lcp_display = lighthouse.get('audits', {}).get('largest-contentful-paint', {}).get('displayValue', 'N/A')
-            
-            return {"score": int(score), "lcp": lcp_display, "msg": "Successfully retrieved cloud metrics."}
-        else:
-            return {"score": "Error", "lcp": "Error", "msg": f"API Rejected Key (Code {response.status_code})"}
+        # Mobile tests of heavy pages regularly take over a minute, hence the long timeout.
+        response = requests.get(endpoint, params=params, timeout=timeout)
+        data = response.json() if response.content else {}
+        if response.status_code != 200:
+            reason = (data.get("error") or {}).get("message", "") if isinstance(data, dict) else ""
+            return {"score": "Error", "lcp": "Error", "msg": scrub(f"PageSpeed error {response.status_code}: {reason}".rstrip(": "))}
+
+        lighthouse = data.get('lighthouseResult', {})
+        audits = lighthouse.get('audits', {})
+        raw_score = lighthouse.get('categories', {}).get('performance', {}).get('score')
+
+        result = {
+            "score": int(round(raw_score * 100)) if raw_score is not None else "N/A",
+            "field_data": _parse_field_data(data),
+            "fixes": _parse_fixes(audits),
+            "msg": "Successfully retrieved cloud metrics.",
+        }
+        for name, audit_id in PSI_LAB_METRICS.items():
+            result[name] = audits.get(audit_id, {}).get('displayValue', 'N/A')
+        return result
     except Exception as e:
-        return {"score": "Offline", "lcp": "Offline", "msg": f"API Connection Timed Out: {str(e)}"}
+        # Never store the raw exception text: it can contain the request URL, including the key.
+        return {"score": "Offline", "lcp": "Offline", "msg": scrub(f"API Connection Failed ({type(e).__name__}): {e}")}
+
+def format_score(score):
+    return f"{score}/100" if isinstance(score, int) else str(score)
 
 def audit_url(url):
     """Scrapes a target website from the outside and appends background API data."""
@@ -67,7 +137,9 @@ def audit_url(url):
     title = title_tag.text.strip() if title_tag else None
 
     meta_desc_tag = soup.find('meta', attrs={'name': 'description'}) or soup.find('meta', attrs={'property': 'og:description'})
-    meta_description = meta_desc_tag['content'].strip() if meta_desc_tag else None
+    # A meta tag can exist without a content attribute; treat that as missing.
+    meta_description = (meta_desc_tag.get('content') or '').strip() if meta_desc_tag else ''
+    meta_description = meta_description or None
 
     # --- 2. Heading Tag Hierarchy ---
     headings = {}
@@ -91,19 +163,35 @@ def audit_url(url):
             external_links += 1
 
     # --- 5. Integrated Conditional API Hook System ---
-    performance_score = "Not Configured"
-    lcp_metric = "Not Configured"
-    api_status = "Skipped - No active credentials located in file manager."
-    
+    performance = {
+        "strategy": "mobile",
+        "score": "Not Configured",
+        "desktop_score": "Not Configured",
+        "lcp": "Not Configured",
+        "api_status_log": "Skipped - No active credentials located in file manager.",
+    }
+
     keys = load_api_keys()
     google_key = keys.get("google_pagespeed_key", "").strip()
-    
+
     if google_key:
-        api_status = "Connecting to Google Cloud Engines..."
-        speed_report = fetch_google_pagespeed(url, google_key)
-        performance_score = f"{speed_report['score']}/100"
-        lcp_metric = speed_report['lcp']
-        api_status = speed_report['msg']
+        # Google ranks sites on their mobile version, so mobile is the headline result.
+        # Desktop runs at the same time for comparison only.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            mobile_job = pool.submit(fetch_google_pagespeed, url, google_key, "mobile")
+            desktop_job = pool.submit(fetch_google_pagespeed, url, google_key, "desktop")
+            mobile, desktop = mobile_job.result(), desktop_job.result()
+
+        performance.update({
+            "score": format_score(mobile["score"]),
+            "desktop_score": format_score(desktop["score"]),
+            "lcp": mobile.get("lcp", "N/A"),
+            "api_status_log": mobile["msg"],
+        })
+        for name in ("cls", "fcp", "tbt", "speed_index"):
+            performance[name] = mobile.get(name, "N/A")
+        performance["field_data"] = mobile.get("field_data")
+        performance["fixes"] = mobile.get("fixes", [])
 
     # --- 6. Unified JSON Report Payload ---
     report = {
@@ -123,11 +211,7 @@ def audit_url(url):
             "internal_count": internal_links,
             "external_count": external_links
         },
-        "performance": {
-            "score": performance_score,
-            "lcp": lcp_metric,
-            "api_status_log": api_status
-        }
+        "performance": performance
     }
 
     return report

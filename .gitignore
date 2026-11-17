@@ -12,3 +12,7 @@ __pycache__/
 build/
 dist/
 *.spec
+
+# Ignore exported client reports and sample audit output
+*_Full_SEO_Report.html
+seo_audit_result.json
